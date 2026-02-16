@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {Test, console} from "forge-std/Test.sol";
+import {Test} from "forge-std/Test.sol";
 import {Raffle} from "../src/Raffle.sol";
 import {RaffleFactory} from "../src/RaffleFactory.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
@@ -49,6 +49,7 @@ contract RaffleTest is Test {
         assetToken.approve(address(factory), ASSET_AMOUNT);
 
         address raffleAddr = factory.createRaffle(
+            address(0), // raffleSeller: address(0) means use msg.sender
             address(assetToken),
             ASSET_AMOUNT,
             address(paymentToken),
@@ -193,6 +194,7 @@ contract RaffleTest is Test {
         assetToken.approve(address(factory), ASSET_AMOUNT);
 
         address raffleAddr = factory.createRaffle(
+            address(0), // raffleSeller: address(0) means use msg.sender
             address(assetToken),
             ASSET_AMOUNT,
             address(paymentToken),
@@ -251,6 +253,8 @@ contract RaffleTest is Test {
         _createRaffle();
         _buyEnoughTickets();
 
+        // Ensure we have enough blocks before finalization
+        vm.roll(block.number + WINNERS_COUNT + 10);
         vm.warp(raffle.endTime() + 1);
         raffle.finalize();
 
@@ -280,140 +284,62 @@ contract RaffleTest is Test {
         assertFalse(raffle.succeeded());
     }
 
-    function test_PickWinners_AutomaticallyOnFirstClaim() public {
+    function test_PickWinners_AutomaticallyDuringFinalize() public {
         _createRaffle();
         _buyEnoughTickets();
+
+        // Ensure we have enough blocks before finalization (need at least winnersCount blocks)
+        vm.roll(block.number + WINNERS_COUNT + 10);
+
+        // Finalize - winners should be picked automatically
         _finalize();
 
-        // Verify winners not set yet
-        address[] memory winnersBefore = raffle.getWinners();
-        assertEq(winnersBefore.length, 0);
-
-        // Advance blocks so that blockhash(finalizationBlock + 5 + i) is available
-        uint256 finalizationBlock = block.number;
-        vm.roll(finalizationBlock + 10);
-
-        // Winners will be picked automatically when claimPrize is called
-        // Find a winner by trying each buyer
-        bool winnerFound = false;
-        for (uint256 i = 0; i < 3 && !winnerFound; i++) {
-            address buyer = i == 0 ? buyer1 : (i == 1 ? buyer2 : buyer3);
-            vm.prank(buyer);
-            try raffle.claimPrize() {
-                winnerFound = true;
-                // Verify winners are now set
-                address[] memory winners = raffle.getWinners();
-                assertEq(winners.length, WINNERS_COUNT);
-            } catch {}
-        }
-
-        assertTrue(winnerFound, "Should find at least one winner");
+        // Verify winners are set immediately after finalize
+        address[] memory winners = raffle.getWinners();
+        assertEq(winners.length, WINNERS_COUNT);
+        assertGt(winners.length, 0); // Winners are set
     }
 
-    function test_ClaimPrize_RevertBlockhashNotAvailable() public {
+    function test_Finalize_RevertInsufficientBlocks() public {
         _createRaffle();
         _buyEnoughTickets();
-        _finalize();
 
-        // Don't advance enough blocks - blockhash will be 0
-        // We need at least 5 blocks after finalization
-        vm.roll(block.number + 3); // Only 3 blocks, not enough
-
-        // Try to claim prize - should revert because blockhash is not available
-        // We need to find a winner first, but the revert will happen in _pickWinners
-        // Let's try each buyer until we hit the revert
-        bool reverted = false;
-        for (uint256 i = 0; i < 3 && !reverted; i++) {
-            address buyer = i == 0 ? buyer1 : (i == 1 ? buyer2 : buyer3);
-            vm.prank(buyer);
-            try raffle.claimPrize() {
-                // If this succeeds, it means blockhash was available (unlikely with only 3 blocks)
-                // But we'll check if winners were set
-            } catch (bytes memory reason) {
-                if (
-                    keccak256(reason) ==
-                    keccak256(
-                        "Raffle: block hash not found, try after some time"
-                    )
-                ) {
-                    reverted = true;
-                }
-            }
-        }
-
-        // With only 3 blocks advanced, blockhash(finalizationBlock + 5) should be 0
-        // So _pickWinners should revert
-        // Let's verify by trying to claim as any buyer
-        vm.prank(buyer1);
-        vm.expectRevert("Raffle: block hash not found, try after some time");
-        raffle.claimPrize();
+        // Don't advance enough blocks - we need at least winnersCount blocks before finalization
+        // If we finalize with fewer blocks, _pickWinners will revert
+        vm.warp(raffle.endTime() + 1);
+        
+        // Try to finalize with insufficient blocks (less than winnersCount)
+        // This should revert during _pickWinners
+        vm.expectRevert("Raffle: insufficient blocks");
+        raffle.finalize();
     }
 
     function test_ClaimPrize() public {
         _createRaffle();
         _buyEnoughTickets();
+
+        // Ensure we have enough blocks before finalization
+        vm.roll(block.number + WINNERS_COUNT + 10);
         _finalize();
 
-        // Advance blocks so that blockhash(finalizationBlock + 5 + i) is available
-        uint256 finalizationBlock = block.number;
-        vm.roll(finalizationBlock + 10);
+        // Winners are already picked during finalize
+        address[] memory winners = raffle.getWinners();
+        assertEq(winners.length, WINNERS_COUNT);
 
-        // Winners will be picked automatically on first claimPrize call
-        // Find a winner by trying each buyer until one succeeds
-        address winner = address(0);
-        uint256 winnerBalanceBefore = 0;
+        // Find a winner and claim their prize
+        address winner = winners[0];
+        uint256 winnerBalanceBefore = assetToken.balanceOf(winner);
+        uint256 prizePerWinner = ASSET_AMOUNT / WINNERS_COUNT;
 
-        // Try buyer1
-        winnerBalanceBefore = assetToken.balanceOf(buyer1);
-        vm.prank(buyer1);
-        try raffle.claimPrize() {
-            winner = buyer1;
-        } catch {
-            // Try buyer2
-            winnerBalanceBefore = assetToken.balanceOf(buyer2);
-            vm.prank(buyer2);
-            try raffle.claimPrize() {
-                winner = buyer2;
-            } catch {
-                // Try buyer3
-                winnerBalanceBefore = assetToken.balanceOf(buyer3);
-                vm.prank(buyer3);
-                try raffle.claimPrize() {
-                    winner = buyer3;
-                } catch {
-                    // If none work, we need to check all ticket holders
-                    // For simplicity, we'll just verify the mechanism
-                }
-            }
-        }
-        if (winner != address(0)) {
-            // Verify winner got a prize
-            uint256 prizePerWinner = ASSET_AMOUNT / WINNERS_COUNT;
-            assertGe(
-                assetToken.balanceOf(winner),
-                winnerBalanceBefore + prizePerWinner
-            );
-            assertEq(raffle.pendingWithdrawals(winner), 0);
+        vm.prank(winner);
+        raffle.claimPrize();
 
-            // Verify winners array is populated
-            address[] memory winners = raffle.getWinners();
-            assertEq(winners.length, WINNERS_COUNT);
-
-            // Verify winner is in the winners array
-            bool found = false;
-            for (uint256 i = 0; i < winners.length; i++) {
-                if (winners[i] == winner) {
-                    found = true;
-                    break;
-                }
-            }
-            assertTrue(found, "Winner should be in winners array");
-        } else {
-            // If we can't find a winner in the first 3 buyers,
-            // it means the random selection picked different ticket holders
-            // This is fine - the mechanism still works
-            // Just verify that winners would be set if someone claims
-        }
+        // Verify winner got a prize (at least prizePerWinner, could be more if remainder)
+        assertGe(
+            assetToken.balanceOf(winner),
+            winnerBalanceBefore + prizePerWinner
+        );
+        assertEq(raffle.pendingWithdrawals(winner), 0);
     }
 
     function test_ClaimRefund() public {
@@ -565,6 +491,7 @@ contract RaffleTest is Test {
         assertFalse(raffle.hasFailed());
 
         // After finalization, should show as succeeded
+        vm.roll(block.number + WINNERS_COUNT + 10);
         raffle.finalize();
         assertFalse(raffle.hasFailed());
         assertTrue(raffle.succeeded());
@@ -593,47 +520,22 @@ contract RaffleTest is Test {
         // This is a basic test - in production, use a reentrancy attack contract
         _createRaffle();
         _buyEnoughTickets();
+
+        // Ensure we have enough blocks before finalization
+        vm.roll(block.number + WINNERS_COUNT + 10);
         _finalize();
 
-        // Advance blocks for blockhash availability
-        vm.roll(block.number + 10);
+        // Winners are already picked during finalize
+        address[] memory winners = raffle.getWinners();
+        require(winners.length > 0, "No winners found");
 
-        // Try to claim prize - winners will be picked automatically
-        // We need to find a winner first
-        address[] memory winners = new address[](WINNERS_COUNT);
-        bool foundWinner = false;
-
-        // Try each buyer to see who won
-        vm.startPrank(buyer1);
-        try raffle.claimPrize() {
-            winners[0] = buyer1;
-            foundWinner = true;
-        } catch {}
-        vm.stopPrank();
-
-        if (!foundWinner) {
-            vm.startPrank(buyer2);
-            try raffle.claimPrize() {
-                winners[0] = buyer2;
-                foundWinner = true;
-            } catch {}
-            vm.stopPrank();
-        }
-
-        if (!foundWinner) {
-            vm.startPrank(buyer3);
-            try raffle.claimPrize() {
-                winners[0] = buyer3;
-                foundWinner = true;
-            } catch {}
-            vm.stopPrank();
-        }
-
-        require(foundWinner, "No winner found");
-
-        // Now try to claim prize twice (should fail on second call)
+        // Claim prize once (should succeed)
         vm.prank(winners[0]);
-        vm.expectRevert();
+        raffle.claimPrize();
+
+        // Now try to claim prize twice (should fail - already claimed)
+        vm.prank(winners[0]);
+        vm.expectRevert("Raffle: no prize to claim");
         raffle.claimPrize();
     }
 
@@ -647,6 +549,7 @@ contract RaffleTest is Test {
         assetToken.approve(address(factory), ASSET_AMOUNT);
 
         address raffleAddr = factory.createRaffle(
+            address(0), // raffleSeller: address(0) means use msg.sender
             address(assetToken),
             ASSET_AMOUNT,
             address(paymentToken),
@@ -664,12 +567,13 @@ contract RaffleTest is Test {
         vm.warp(startTime);
     }
 
-    function _createRaffleETH() internal {
+    function _createRaffleEth() internal {
         uint256 startTime = block.timestamp + 1 days;
         uint256 endTime = block.timestamp + 7 days;
 
         vm.startPrank(seller);
         address raffleAddr = factory.createRaffle(
+            address(0), // raffleSeller: address(0) means use msg.sender
             address(assetToken),
             ASSET_AMOUNT,
             address(0), // ETH
@@ -717,16 +621,352 @@ contract RaffleTest is Test {
     }
 
     function _finalize() internal {
+        // Ensure we have enough blocks before finalization (need at least winnersCount)
+        vm.roll(block.number + WINNERS_COUNT + 10);
         vm.warp(raffle.endTime() + 1);
         raffle.finalize();
     }
 
-    function _pickWinners() internal {
-        // Advance blocks so that blockhash(finalizationBlock + 5 + i) is available
-        // We need at least 5 blocks after finalization for the first winner
-        vm.roll(block.number + 10);
+    function test_CreateRaffle_WithCustomSeller() public {
+        uint256 startTime = block.timestamp + 1 days;
+        uint256 endTime = block.timestamp + 7 days;
+        address customSeller = address(0x10);
 
-        // Winners are picked automatically when claimPrize is called
-        // This helper just ensures enough blocks have passed
+        // Mint assets to customSeller (factory transfers from _raffleSeller)
+        assetToken.mint(customSeller, ASSET_AMOUNT);
+
+        vm.startPrank(customSeller);
+        // Approve factory to transfer asset from customSeller
+        assetToken.approve(address(factory), ASSET_AMOUNT);
+
+        address raffleAddr = factory.createRaffle(
+            customSeller, // Custom seller address
+            address(assetToken),
+            ASSET_AMOUNT,
+            address(paymentToken),
+            TICKET_PRICE,
+            TICKET_CAP,
+            SELLER_MIN,
+            startTime,
+            endTime,
+            WINNERS_COUNT
+        );
+        vm.stopPrank();
+
+        raffle = Raffle(raffleAddr);
+        assertEq(raffle.seller(), customSeller);
+        assertTrue(factory.isRaffle(raffleAddr));
+    }
+
+    function test_CreateRaffle_WithCustomSeller_WithdrawWorks() public {
+        uint256 startTime = block.timestamp + 1 days;
+        uint256 endTime = block.timestamp + 7 days;
+        address customSeller = address(0x10);
+
+        // Mint assets to customSeller (factory transfers from _raffleSeller)
+        assetToken.mint(customSeller, ASSET_AMOUNT);
+
+        vm.startPrank(customSeller);
+        // Approve factory to transfer asset from customSeller
+        assetToken.approve(address(factory), ASSET_AMOUNT);
+
+        address raffleAddr = factory.createRaffle(
+            customSeller, // Custom seller address
+            address(assetToken),
+            ASSET_AMOUNT,
+            address(paymentToken),
+            TICKET_PRICE,
+            TICKET_CAP,
+            SELLER_MIN,
+            startTime,
+            endTime,
+            WINNERS_COUNT
+        );
+        vm.stopPrank();
+
+        raffle = Raffle(raffleAddr);
+        assertEq(raffle.seller(), customSeller);
+
+        // Warp to start time
+        vm.warp(startTime);
+        _buyEnoughTickets();
+        _finalize();
+
+        // Custom seller should be able to withdraw
+        uint256 calculatedPayout = raffle.totalFunds() -
+            ((raffle.totalFunds() * FEE_BPS) / 10000);
+        uint256 balanceBefore = paymentToken.balanceOf(customSeller);
+
+        vm.prank(customSeller);
+        raffle.withdrawSeller();
+
+        assertEq(
+            paymentToken.balanceOf(customSeller),
+            balanceBefore + calculatedPayout
+        );
+        assertEq(raffle.pendingWithdrawals(customSeller), 0);
+    }
+
+    // ============ Missing Test Cases ============
+
+    function test_DoublePrizeClaim_Revert() public {
+        _createRaffle();
+        _buyEnoughTickets();
+        vm.roll(block.number + WINNERS_COUNT + 10);
+        _finalize();
+
+        address[] memory winners = raffle.getWinners();
+        require(winners.length > 0, "No winners");
+
+        address winner = winners[0];
+        uint256 prize = raffle.pendingWithdrawals(winner);
+        require(prize > 0, "No prize");
+
+        // First claim should succeed
+        vm.prank(winner);
+        raffle.claimPrize();
+
+        // Second claim should fail
+        vm.prank(winner);
+        vm.expectRevert("Raffle: no prize to claim");
+        raffle.claimPrize();
+    }
+
+    function test_MultipleWithdrawAsset_Revert() public {
+        _createRaffle();
+
+        // Buy tickets but raffle fails
+        vm.startPrank(buyer1);
+        paymentToken.approve(address(raffle), 10 * TICKET_PRICE);
+        raffle.buyTickets(10, address(0));
+        vm.stopPrank();
+
+        vm.warp(raffle.endTime() + 1);
+        raffle.finalize();
+
+        assertTrue(raffle.finalized());
+        assertFalse(raffle.succeeded());
+
+        // First withdrawal should succeed
+        vm.prank(seller);
+        raffle.withdrawAsset();
+
+        // Second withdrawal should fail (insufficient balance)
+        vm.prank(seller);
+        vm.expectRevert();
+        raffle.withdrawAsset();
+    }
+
+    function test_SameWinnerWinsMultipleTimes() public {
+        _createRaffle();
+
+        // One buyer buys all tickets
+        vm.startPrank(buyer1);
+        paymentToken.approve(address(raffle), TICKET_CAP * TICKET_PRICE);
+        raffle.buyTickets(TICKET_CAP, address(0));
+        vm.stopPrank();
+
+        vm.roll(block.number + WINNERS_COUNT + 10);
+        _finalize();
+
+        // Since buyer1 owns all tickets, they can win multiple times
+        address[] memory winners = raffle.getWinners();
+        assertEq(winners.length, WINNERS_COUNT);
+
+        // Count how many times buyer1 won
+        uint256 buyer1Wins = 0;
+        for (uint256 i = 0; i < winners.length; i++) {
+            if (winners[i] == buyer1) {
+                buyer1Wins++;
+            }
+        }
+
+        // Buyer1 should have won at least once (likely multiple times)
+        assertGe(buyer1Wins, 1);
+    }
+
+    function test_FinalizeCalledTwice_Revert() public {
+        _createRaffle();
+        _buyEnoughTickets();
+        vm.roll(block.number + WINNERS_COUNT + 10);
+        _finalize();
+
+        // Try to finalize again
+        vm.expectRevert("Raffle: already finalized");
+        raffle.finalize();
+    }
+
+    function test_BuyTicketsAtExactEndTime() public {
+        _createRaffle();
+
+        // Buy tickets at exact endTime (should succeed)
+        vm.warp(raffle.endTime());
+        vm.startPrank(buyer1);
+        paymentToken.approve(address(raffle), TICKET_PRICE);
+        raffle.buyTickets(1, address(0));
+        vm.stopPrank();
+
+        assertEq(raffle.tickets(buyer1), 1);
+
+        // Try to buy after endTime (should fail)
+        vm.warp(raffle.endTime() + 1);
+        vm.startPrank(buyer2);
+        paymentToken.approve(address(raffle), TICKET_PRICE);
+        vm.expectRevert("Raffle: not active");
+        raffle.buyTickets(1, address(0));
+        vm.stopPrank();
+    }
+
+    function test_MaxWinnersCount() public {
+        uint256 startTime = block.timestamp + 1 days;
+        uint256 endTime = block.timestamp + 7 days;
+
+        vm.startPrank(seller);
+        assetToken.approve(address(factory), ASSET_AMOUNT);
+
+        // Try to create raffle with winnersCount > MAX_WINNERS_COUNT (200)
+        vm.expectRevert("Raffle: winners count too high");
+        factory.createRaffle(
+            address(0),
+            address(assetToken),
+            ASSET_AMOUNT,
+            address(paymentToken),
+            TICKET_PRICE,
+            300, // ticketCap
+            300 * TICKET_PRICE, // sellerMin
+            startTime,
+            endTime,
+            201 // winnersCount > MAX_WINNERS_COUNT
+        );
+        vm.stopPrank();
+    }
+
+    function test_RefundAndAssetWithdrawal_FailedRaffle() public {
+        _createRaffle();
+
+        // Buy tickets but raffle fails
+        vm.startPrank(buyer1);
+        paymentToken.approve(address(raffle), 10 * TICKET_PRICE);
+        raffle.buyTickets(10, address(0));
+        vm.stopPrank();
+
+        vm.warp(raffle.endTime() + 1);
+        raffle.finalize();
+
+        assertTrue(raffle.finalized());
+        assertFalse(raffle.succeeded());
+
+        // Buyer claims refund
+        uint256 buyerBalanceBefore = paymentToken.balanceOf(buyer1);
+        vm.prank(buyer1);
+        raffle.claimRefund();
+        assertEq(
+            paymentToken.balanceOf(buyer1),
+            buyerBalanceBefore + 10 * TICKET_PRICE
+        );
+
+        // Seller withdraws asset
+        uint256 sellerBalanceBefore = assetToken.balanceOf(seller);
+        vm.prank(seller);
+        raffle.withdrawAsset();
+        assertEq(
+            assetToken.balanceOf(seller),
+            sellerBalanceBefore + ASSET_AMOUNT
+        );
+    }
+
+    function test_AllWinnersClaimPrizes() public {
+        _createRaffle();
+        _buyEnoughTickets();
+        vm.roll(block.number + WINNERS_COUNT + 10);
+        _finalize();
+
+        address[] memory winners = raffle.getWinners();
+        assertEq(winners.length, WINNERS_COUNT);
+
+        uint256 totalPrizeClaimed = 0;
+
+        // All winners claim their prizes
+        // Note: Some addresses might win multiple times, so we need to track unique winners
+        // Use a simple approach: collect unique winners first
+        address[] memory uniqueWinners = new address[](WINNERS_COUNT);
+        uint256 uniqueCount = 0;
+        
+        for (uint256 i = 0; i < winners.length; i++) {
+            bool found = false;
+            for (uint256 j = 0; j < uniqueCount; j++) {
+                if (uniqueWinners[j] == winners[i]) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                uniqueWinners[uniqueCount] = winners[i];
+                uniqueCount++;
+            }
+        }
+
+        // Claim prizes for unique winners
+        for (uint256 i = 0; i < uniqueCount; i++) {
+            address winner = uniqueWinners[i];
+            uint256 balanceBefore = assetToken.balanceOf(winner);
+            uint256 prize = raffle.pendingWithdrawals(winner);
+            if (prize > 0) {
+                vm.prank(winner);
+                raffle.claimPrize();
+
+                uint256 balanceAfter = assetToken.balanceOf(winner);
+                assertEq(balanceAfter - balanceBefore, prize);
+                totalPrizeClaimed += prize;
+            }
+        }
+
+        // Total prizes claimed should equal assetAmount
+        assertEq(totalPrizeClaimed, ASSET_AMOUNT);
+    }
+
+    function test_CreateRaffleWithCustomSeller_AssetTransfer() public {
+        uint256 startTime = block.timestamp + 1 days;
+        uint256 endTime = block.timestamp + 7 days;
+        address customSeller = address(0x10);
+
+        // Mint assets to customSeller (factory transfers from _raffleSeller when customSeller is specified)
+        assetToken.mint(customSeller, ASSET_AMOUNT);
+
+        vm.startPrank(customSeller);
+        // Approve factory to transfer from customSeller
+        assetToken.approve(address(factory), ASSET_AMOUNT);
+
+        // Create raffle with customSeller
+        address raffleAddr = factory.createRaffle(
+            customSeller, // Custom seller
+            address(assetToken),
+            ASSET_AMOUNT,
+            address(paymentToken),
+            TICKET_PRICE,
+            TICKET_CAP,
+            SELLER_MIN,
+            startTime,
+            endTime,
+            WINNERS_COUNT
+        );
+        vm.stopPrank();
+
+        raffle = Raffle(raffleAddr);
+        assertEq(raffle.seller(), customSeller);
+        // Asset should be transferred from customSeller
+        assertEq(assetToken.balanceOf(raffleAddr), ASSET_AMOUNT);
+    }
+
+    function test_InsufficientBlocksBeforeFinalization() public {
+        _createRaffle();
+        _buyEnoughTickets();
+
+        vm.warp(raffle.endTime() + 1);
+
+        // Try to finalize without enough blocks (need at least winnersCount blocks)
+        // This should revert
+        vm.expectRevert("Raffle: insufficient blocks");
+        raffle.finalize();
     }
 }

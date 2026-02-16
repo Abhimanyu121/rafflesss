@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {Test, console} from "forge-std/Test.sol";
+import {Test} from "forge-std/Test.sol";
 import {Raffle} from "../src/Raffle.sol";
 import {RaffleFactory} from "../src/RaffleFactory.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
@@ -43,6 +43,7 @@ contract RaffleFuzzTest is Test {
         assetToken.approve(address(factory), 1000 ether);
 
         address raffleAddr = factory.createRaffle(
+            address(0), // raffleSeller: address(0) means use msg.sender
             address(assetToken),
             1000 ether,
             address(paymentToken),
@@ -115,6 +116,7 @@ contract RaffleFuzzTest is Test {
         assetToken.approve(address(factory), 1000 ether);
 
         address raffleAddr = factory.createRaffle(
+            address(0), // raffleSeller: address(0) means use msg.sender
             address(assetToken),
             1000 ether,
             address(paymentToken),
@@ -167,6 +169,7 @@ contract RaffleFuzzTest is Test {
         assetToken.approve(address(fuzzFactory), 1000 ether);
 
         address raffleAddr = fuzzFactory.createRaffle(
+            address(0), // raffleSeller: address(0) means use msg.sender
             address(assetToken),
             1000 ether,
             address(paymentToken),
@@ -195,6 +198,8 @@ contract RaffleFuzzTest is Test {
         raffle.buyTickets(ticketsToBuy, address(0));
         vm.stopPrank();
 
+        // Ensure we have enough blocks before finalization (need at least winnersCount = 3)
+        vm.roll(block.number + 3 + 10);
         vm.warp(endTime + 1);
         raffle.finalize();
 
@@ -204,5 +209,9 @@ contract RaffleFuzzTest is Test {
         uint256 expectedFee = (raffle.totalFunds() * feeBps) / 10000;
         uint256 expectedPayout = raffle.totalFunds() - expectedFee;
         assertEq(raffle.pendingWithdrawals(seller), expectedPayout);
+        
+        // Winners should be picked automatically during finalize
+        address[] memory winners = raffle.getWinners();
+        assertEq(winners.length, 3);
     }
 }

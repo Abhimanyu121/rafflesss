@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {
     SafeERC20
@@ -9,7 +8,6 @@ import {
 import {
     ReentrancyGuard
 } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 /// @title Raffle
 /// @notice A minimal, extensible raffle contract for selling tickets and distributing prizes
@@ -20,6 +18,7 @@ contract Raffle is ReentrancyGuard {
     // ============ Constants ============
     address public constant ETH_ADDRESS = address(0);
     uint256 public constant MAX_TICKETS_PER_ADDRESS = 10000; // Prevent single-wallet domination
+    uint256 public constant MAX_WINNERS_COUNT = 200; // Maximum winners to ensure sufficient block history (200 blocks ≈ 40 minutes)
 
     // ============ State Variables ============
     address public factory;
@@ -77,22 +76,34 @@ contract Raffle is ReentrancyGuard {
 
     // ============ Modifiers ============
     modifier onlyFactory() {
-        require(msg.sender == factory, "Raffle: only factory");
+        _onlyFactory();
         _;
     }
 
+    function _onlyFactory() internal view {
+        require(msg.sender == factory, "Raffle: only factory");
+    }
+
     modifier onlyActive() {
+        _onlyActive();
+        _;
+    }
+
+    function _onlyActive() internal view {
         require(
             block.timestamp >= startTime && block.timestamp <= endTime,
             "Raffle: not active"
         );
         require(!finalized, "Raffle: already finalized");
-        _;
     }
 
     modifier onlyAfterEnd() {
-        require(block.timestamp > endTime, "Raffle: not ended");
+        _onlyAfterEnd();
         _;
+    }
+
+    function _onlyAfterEnd() internal view {
+        require(block.timestamp > endTime, "Raffle: not ended");
     }
 
     // ============ Constructor ============
@@ -140,6 +151,10 @@ contract Raffle is ReentrancyGuard {
             "Raffle: invalid winners count"
         );
         require(
+            _winnersCount <= MAX_WINNERS_COUNT,
+            "Raffle: winners count too high"
+        );
+        require(
             _ticketPrice * _ticketCap == _sellerMin,
             "Raffle: invalid ticket price"
         );
@@ -174,8 +189,9 @@ contract Raffle is ReentrancyGuard {
     }
 
     // ============ Public Functions ============
-    /// @notice Buy tickets (ETH or ERC20)
+    /// @notice Buy tickets (ERC20 only - use WETH for native ETH)
     /// @param n Number of tickets to buy
+    /// @param recipient Address to assign tickets to (address(0) to use msg.sender)
     function buyTickets(
         uint256 n,
         address recipient
@@ -212,6 +228,7 @@ contract Raffle is ReentrancyGuard {
 
         finalized = true;
         // Raffle succeeds only if totalFunds exactly equals sellerMin by endTime
+        // This is a design decision: all tickets must be sold for success (all-or-nothing)
         // Time-based check: if endTime has passed and totalFunds < sellerMin, it has failed
         succeeded = (block.timestamp >= endTime) && (totalFunds == sellerMin);
 
@@ -229,6 +246,9 @@ contract Raffle is ReentrancyGuard {
             if (protocolFee > 0 && feeRecipient != address(0)) {
                 IERC20(paymentToken).safeTransfer(feeRecipient, protocolFee);
             }
+
+            // Pick winners immediately using past blocks (no waiting required)
+            _pickWinners();
         }
 
         emit Finalized(succeeded, totalFunds);
@@ -249,12 +269,11 @@ contract Raffle is ReentrancyGuard {
     }
 
     /// @notice Claim prize (for winners)
+    /// @dev Winners are picked automatically during finalize(), so they should already be set
     function claimPrize() external nonReentrant {
         require(finalized, "Raffle: not finalized");
         require(succeeded, "Raffle: raffle failed");
-        if (!winnersSet) {
-            _pickWinners();
-        }
+        require(winnersSet, "Raffle: winners not set");
         require(winners.length > 0, "Raffle: winners not set");
 
         bool isWinner = false;
@@ -329,27 +348,37 @@ contract Raffle is ReentrancyGuard {
     function canFinalize() external view returns (bool) {
         return (block.timestamp >= endTime) && !finalized;
     }
+    /// @notice Pick winners using blockhashes from past blocks
+    /// @dev Uses consecutive blocks going backwards from finalization block
+    /// @dev Note: Users with many tickets can win multiple times (by design)
     function _pickWinners() internal {
+        // Ensure we have enough blocks before finalization
+        require(
+            finalizationBlock >= winnersCount,
+            "Raffle: insufficient blocks"
+        );
+
         // Calculate prize per winner (equal split)
         uint256 prizePerWinner = assetAmount / winnersCount;
         uint256 remainder = assetAmount % winnersCount;
+
         for (uint256 i = 0; i < winnersCount; i++) {
-            bytes32 blockHash = blockhash(finalizationBlock + 5 + i);
-            require(
-                blockHash != bytes32(0),
-                "Raffle: block hash not found, try after some time"
-            );
+            // Use consecutive blocks going backwards: finalizationBlock - 1, finalizationBlock - 2, etc.
+            bytes32 blockHash = blockhash(finalizationBlock - 1 - i);
             uint256 random = uint256(blockHash);
             random = random % totalTickets;
+
+            // Handle collisions: if this ticket index already won, try next one
+            // Note: After 3 attempts, we allow duplicate wins (users with many tickets can win multiple times)
             uint k = 0;
             while (winningIndex[random]) {
                 random = (random + 1) % totalTickets;
                 k++;
-                //we dont want to loop forever, we will give double win here.
                 if (k > 2) {
-                    break;
+                    break; // Allow duplicate wins after 3 attempts
                 }
             }
+
             winners.push(ticketHolders[random]);
             winningIndex[random] = true;
             uint256 prize = prizePerWinner;

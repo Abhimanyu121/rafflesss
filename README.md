@@ -6,7 +6,7 @@ A minimal, extensible smart contract system for running raffles on Ethereum. Bui
 
 This system implements a factory pattern that deploys minimal proxy clones (EIP-1167) for each raffle, making it gas-efficient and extensible. Each raffle:
 
-- Accepts tickets purchased with ETH or ERC20 tokens
+- Accepts tickets purchased with ERC20 tokens (use WETH for native ETH)
 - Locks seller assets until the raffle completes
 - Uses pull-based withdrawals for security
 - Supports configurable protocol fees
@@ -17,15 +17,14 @@ This system implements a factory pattern that deploys minimal proxy clones (EIP-
 ### Contracts
 
 1. **RaffleFactory** - Deploys raffle clones and manages global settings
-   - `createRaffle()` - Creates a new raffle clone
+   - `createRaffle(address raffleSeller, ...)` - Creates a new raffle clone (raffleSeller can be address(0) to use msg.sender)
    - `setFeeBps()` - Updates protocol fee (basis points)
    - `setFeeRecipient()` - Updates fee recipient address
    - `setRandomnessProvider()` - Sets randomness provider for VRF integration
 
 2. **Raffle** - Individual raffle contract (deployed as clone)
-   - `buyTickets(uint256 n)` - Purchase tickets (ETH or ERC20)
-   - `finalize()` - Finalize raffle after end time
-   - `setWinners(address[] winners)` - Set winners (called by factory/relayer)
+   - `buyTickets(uint256 n, address recipient)` - Purchase tickets (ERC20 only, use WETH for native ETH)
+   - `finalize()` - Finalize raffle after end time (automatically picks winners if succeeded)
    - `claimPrize()` - Winners claim their prizes
    - `claimRefund()` - Losers claim refunds (if raffle failed)
    - `withdrawSeller()` - Seller withdraws proceeds
@@ -35,7 +34,7 @@ This system implements a factory pattern that deploys minimal proxy clones (EIP-
 ## Features
 
 - ✅ EIP-1167 minimal proxy clones (gas-efficient)
-- ✅ Support for ETH and ERC20 payments
+- ✅ Support for ERC20 payments (use WETH for native ETH)
 - ✅ Pull-based withdrawals (secure)
 - ✅ Reentrancy protection
 - ✅ Configurable protocol fees
@@ -48,8 +47,10 @@ This system implements a factory pattern that deploys minimal proxy clones (EIP-
 - Uses OpenZeppelin contracts (`ReentrancyGuard`, `SafeERC20`, `Ownable`)
 - Pull-over-push pattern for fund transfers
 - Access control on critical functions
-- Maximum tickets per address limit
+- Maximum tickets per address limit (10,000)
+- Maximum winners count limit (200)
 - Input validation on all functions
+- Winners picked automatically during finalize() using past blockhashes
 
 ## Development
 
@@ -97,38 +98,50 @@ forge script script/Deploy.s.sol:Deploy --rpc-url $RPC_URL --broadcast --verify
 
 ```solidity
 address raffle = factory.createRaffle(
-    assetToken,      // ERC20 token address (0x0 for ETH)
+    raffleSeller,    // Seller address (address(0) to use msg.sender)
+    assetToken,      // ERC20 token address (must be non-zero, use WETH for native ETH)
     assetAmount,     // Amount of asset to raffle
-    paymentToken,    // Payment token (0x0 for ETH)
+    paymentToken,    // Payment token (must be non-zero, use WETH for native ETH)
     ticketPrice,     // Price per ticket
     ticketCap,       // Maximum tickets
-    sellerMin,       // Minimum funds for success
+    sellerMin,       // Minimum funds for success (must equal ticketPrice * ticketCap)
     startTime,       // Start timestamp
     endTime,         // End timestamp
-    winnersCount     // Number of winners
+    winnersCount     // Number of winners (max 200)
 );
 ```
+
+**Important Design Decisions:**
+- **All-or-nothing success**: Raffle only succeeds if `totalFunds == sellerMin` exactly (all tickets must be sold)
+- **Strict equality**: `sellerMin` must equal `ticketPrice * ticketCap` (enforced during initialization)
+- **No ETH support**: Use WETH (Wrapped ETH) for native ETH functionality
 
 ### Buying Tickets
 
 ```solidity
 // For ERC20 payment
 paymentToken.approve(raffle, amount);
-raffle.buyTickets(count);
+raffle.buyTickets(count, address(0)); // address(0) assigns tickets to msg.sender
 
-// For ETH payment
-raffle.buyTickets{value: amount}(count);
+// To buy tickets for someone else (gifting)
+raffle.buyTickets(count, recipientAddress);
+
+// For native ETH, use WETH instead:
+// 1. Wrap ETH: weth.deposit{value: amount}()
+// 2. Approve: weth.approve(raffle, amount)
+// 3. Buy: raffle.buyTickets(count, address(0))
 ```
 
-### Finalizing and Setting Winners
+### Finalizing and Winner Selection
 
 ```solidity
 // After endTime, anyone can finalize
+// Winners are automatically picked during finalize() if raffle succeeded
 raffle.finalize();
 
-// Factory/relayer sets winners (off-chain selection for MVP)
-address[] memory winners = [...];
-factory.setWinners(raffle, winners);
+// Winners are selected using blockhashes from past blocks (finalizationBlock - 1, -2, -3, etc.)
+// Note: Users with many tickets can win multiple times (by design)
+address[] memory winners = raffle.getWinners();
 ```
 
 ### Claiming
@@ -158,11 +171,11 @@ Run all tests:
 forge test -vv
 ```
 
-## Trust Assumptions (MVP)
+## Trust Assumptions
 
-- **Winner Selection**: Currently off-chain via factory/relayer. For production, integrate Chainlink VRF.
+- **Winner Selection**: Uses blockhashes from past blocks (finalizationBlock - 1, -2, etc.). While not as secure as Chainlink VRF, it's sufficient for many use cases. For high-value raffles, consider integrating Chainlink VRF via `IRandomnessProvider`.
 - **Factory Owner**: Should be a Gnosis Safe multisig with timelock.
-- **Relayer**: Must be trusted (multisig) until VRF integration.
+- **Randomness**: Blockhashes are manipulable by miners, but using past blocks reduces manipulation window. For production, integrate Chainlink VRF.
 
 ## Extensibility
 

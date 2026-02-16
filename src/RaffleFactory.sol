@@ -18,7 +18,7 @@ contract RaffleFactory is Ownable {
     using SafeERC20 for IERC20;
 
     // ============ State Variables ============
-    address public immutable raffleImplementation;
+    address public immutable RAFFLE_IMPLEMENTATION;
     address[] public raffles;
     mapping(address => bool) public isRaffle;
 
@@ -60,7 +60,7 @@ contract RaffleFactory is Ownable {
 
         // Deploy implementation contract
         Raffle implementation = new Raffle();
-        raffleImplementation = address(implementation);
+        RAFFLE_IMPLEMENTATION = address(implementation);
     }
 
     // ============ Public Functions ============
@@ -76,6 +76,7 @@ contract RaffleFactory is Ownable {
     /// @param winnersCount Number of winners
     /// @return raffle The address of the deployed raffle clone
     function createRaffle(
+        address raffleSeller,
         address assetToken,
         uint256 assetAmount,
         address paymentToken,
@@ -87,13 +88,17 @@ contract RaffleFactory is Ownable {
         uint16 winnersCount
     ) external returns (address raffle) {
         // Deploy clone
-        raffle = raffleImplementation.clone();
+        raffle = RAFFLE_IMPLEMENTATION.clone();
         isRaffle[raffle] = true;
         raffles.push(raffle);
+        address _raffleSeller = msg.sender;
+        if (raffleSeller != address(0)) {
+            _raffleSeller = raffleSeller;
+        }
 
         // Initialize clone
         Raffle(raffle).initialize(
-            msg.sender,
+            _raffleSeller,
             assetToken,
             assetAmount,
             paymentToken,
@@ -107,11 +112,11 @@ contract RaffleFactory is Ownable {
 
         // Transfer asset from seller to raffle contract
         // Seller must approve this factory before calling createRaffle
-        IERC20(assetToken).safeTransferFrom(msg.sender, raffle, assetAmount);
+        IERC20(assetToken).safeTransferFrom(_raffleSeller, raffle, assetAmount);
 
         emit RaffleCreated(
             raffle,
-            msg.sender,
+            _raffleSeller,
             assetToken,
             assetAmount,
             paymentToken,

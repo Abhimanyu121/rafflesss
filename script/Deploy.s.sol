@@ -9,7 +9,7 @@ import {RaffleFactory} from "../src/RaffleFactory.sol";
 contract Deploy is Script {
     bytes32 salt =
         bytes32(
-            0x0000000000000000000000000000000000000000000000000000000000000005
+            0x0000000000000000000000000000000000000000000000000000000000000006
         );
     function run() external {
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
@@ -28,7 +28,7 @@ contract Deploy is Script {
         );
 
         console.log("RaffleFactory deployed at:", address(factory));
-        console.log("Implementation address:", factory.raffleImplementation());
+        console.log("Implementation address:", factory.RAFFLE_IMPLEMENTATION());
 
         vm.stopBroadcast();
     }
