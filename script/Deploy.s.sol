@@ -9,12 +9,12 @@ import {RaffleFactory} from "../src/RaffleFactory.sol";
 contract Deploy is Script {
     bytes32 salt =
         bytes32(
-            0x0000000000000000000000000000000000000000000000000000000000000006
+            0x0000000000000000000000000000000000000000000000000000000000000009
         );
     function run() external {
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
         address feeRecipient = vm.envAddress("FEE_RECIPIENT");
-        uint256 feeBps = vm.envOr("FEE_BPS", uint256(200)); // Default 2%
+        uint256 feeBps = vm.envOr("FEE_BPS", uint256(10)); // Default 2%
 
         vm.startBroadcast(deployerPrivateKey);
 

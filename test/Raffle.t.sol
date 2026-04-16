@@ -307,7 +307,7 @@ contract RaffleTest is Test {
         // Don't advance enough blocks - we need at least winnersCount blocks before finalization
         // If we finalize with fewer blocks, _pickWinners will revert
         vm.warp(raffle.endTime() + 1);
-        
+
         // Try to finalize with insufficient blocks (less than winnersCount)
         // This should revert during _pickWinners
         vm.expectRevert("Raffle: insufficient blocks");
@@ -340,6 +340,7 @@ contract RaffleTest is Test {
             winnerBalanceBefore + prizePerWinner
         );
         assertEq(raffle.pendingWithdrawals(winner), 0);
+        assertTrue(raffle.prizeClaimedAll(winner));
     }
 
     function test_ClaimRefund() public {
@@ -362,6 +363,7 @@ contract RaffleTest is Test {
 
         assertEq(paymentToken.balanceOf(buyer1), balanceBefore + refundAmount);
         assertEq(raffle.tickets(buyer1), 0);
+        assertTrue(raffle.refundClaimedAllTickets(buyer1));
     }
 
     function test_WithdrawAsset_FailedRaffle() public {
@@ -396,6 +398,7 @@ contract RaffleTest is Test {
             assetToken.balanceOf(address(raffle)),
             raffleAssetBalanceBefore - ASSET_AMOUNT
         );
+        assertTrue(raffle.assetWithdrawnBySeller());
     }
 
     function test_WithdrawAsset_RevertNotSeller() public {
@@ -412,14 +415,6 @@ contract RaffleTest is Test {
 
         vm.prank(buyer1);
         vm.expectRevert("Raffle: not seller");
-        raffle.withdrawAsset();
-    }
-
-    function test_WithdrawAsset_RevertNotFinalized() public {
-        _createRaffle();
-
-        vm.prank(seller);
-        vm.expectRevert("Raffle: not finalized");
         raffle.withdrawAsset();
     }
 
@@ -891,7 +886,7 @@ contract RaffleTest is Test {
         // Use a simple approach: collect unique winners first
         address[] memory uniqueWinners = new address[](WINNERS_COUNT);
         uint256 uniqueCount = 0;
-        
+
         for (uint256 i = 0; i < winners.length; i++) {
             bool found = false;
             for (uint256 j = 0; j < uniqueCount; j++) {
@@ -968,5 +963,111 @@ contract RaffleTest is Test {
         // This should revert
         vm.expectRevert("Raffle: insufficient blocks");
         raffle.finalize();
+    }
+
+    function test_Flags_RefundClaimed_FlipsOnlyAfterRefundClaim() public {
+        _createRaffle();
+
+        // Failed raffle setup
+        vm.startPrank(buyer1);
+        paymentToken.approve(address(raffle), 10 * TICKET_PRICE);
+        raffle.buyTickets(10, address(0));
+        vm.stopPrank();
+
+        vm.warp(raffle.endTime() + 1);
+        raffle.finalize();
+
+        // Before claim: refund flag should be false
+        assertFalse(raffle.refundClaimedAllTickets(buyer1));
+        (
+            bool refundClaimedBefore,
+            bool prizeClaimedBefore,
+            uint256 remainingTicketsBefore,
+            uint256 pendingPrizeBefore
+        ) = raffle.getUserFlags(buyer1);
+        assertFalse(refundClaimedBefore);
+        assertFalse(prizeClaimedBefore);
+        assertEq(remainingTicketsBefore, 10);
+        assertEq(pendingPrizeBefore, 0);
+
+        // Claim refund -> flag should flip
+        vm.prank(buyer1);
+        raffle.claimRefund();
+
+        assertTrue(raffle.refundClaimedAllTickets(buyer1));
+        (
+            bool refundClaimedAfter,
+            bool prizeClaimedAfter,
+            uint256 remainingTicketsAfter,
+            uint256 pendingPrizeAfter
+        ) = raffle.getUserFlags(buyer1);
+        assertTrue(refundClaimedAfter);
+        assertFalse(prizeClaimedAfter);
+        assertEq(remainingTicketsAfter, 0);
+        assertEq(pendingPrizeAfter, 0);
+    }
+
+    function test_Flags_PrizeClaimed_FlipsOnlyAfterPrizeClaim() public {
+        _createRaffle();
+        _buyEnoughTickets();
+        vm.roll(block.number + WINNERS_COUNT + 10);
+        _finalize();
+
+        address winner = raffle.getWinners()[0];
+
+        // Before claim: prize flag should be false
+        assertFalse(raffle.prizeClaimedAll(winner));
+        (
+            bool refundClaimedBefore,
+            bool prizeClaimedBefore,
+            uint256 remainingTicketsBefore,
+            uint256 pendingPrizeBefore
+        ) = raffle.getUserFlags(winner);
+        assertFalse(refundClaimedBefore);
+        assertFalse(prizeClaimedBefore);
+        assertGt(remainingTicketsBefore, 0);
+        assertGt(pendingPrizeBefore, 0);
+
+        // Claim prize -> flag should flip
+        vm.prank(winner);
+        raffle.claimPrize();
+
+        assertTrue(raffle.prizeClaimedAll(winner));
+        (
+            bool refundClaimedAfter,
+            bool prizeClaimedAfter,
+            uint256 remainingTicketsAfter,
+            uint256 pendingPrizeAfter
+        ) = raffle.getUserFlags(winner);
+        assertFalse(refundClaimedAfter);
+        assertTrue(prizeClaimedAfter);
+        assertGt(remainingTicketsAfter, 0); // ticket ownership doesn't change on prize claim
+        assertEq(pendingPrizeAfter, 0);
+    }
+
+    function test_Flags_AssetWithdrawnBySeller_FlipsOnlyAfterWithdraw() public {
+        _createRaffle();
+
+        // Failed raffle setup
+        vm.startPrank(buyer1);
+        paymentToken.approve(address(raffle), 10 * TICKET_PRICE);
+        raffle.buyTickets(10, address(0));
+        vm.stopPrank();
+
+        vm.warp(raffle.endTime() + 1);
+        raffle.finalize();
+
+        // Before seller withdraw: flag should be false
+        assertFalse(raffle.assetWithdrawnBySeller());
+
+        // Seller withdraws asset -> flag flips
+        vm.prank(seller);
+        raffle.withdrawAsset();
+        assertTrue(raffle.assetWithdrawnBySeller());
+
+        // Cannot withdraw twice
+        vm.prank(seller);
+        vm.expectRevert("Raffle: asset already withdrawn");
+        raffle.withdrawAsset();
     }
 }

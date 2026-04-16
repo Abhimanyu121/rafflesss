@@ -42,12 +42,15 @@ contract Raffle is ReentrancyGuard {
 
     // Finalization state
     bool public finalized;
-    bool public succeeded;
+    bool private _succeededState; // Stored during finalize()
     address[] public winners;
     bool winnersSet;
+    bool public assetWithdrawnBySeller;
 
     // Pull-based withdrawals
     mapping(address => uint256) public pendingWithdrawals; // For refunds and seller payout
+    mapping(address => bool) public refundClaimedAllTickets;
+    mapping(address => bool) public prizeClaimedAll;
 
     // ============ Events ============
     event Initialized(
@@ -161,7 +164,6 @@ contract Raffle is ReentrancyGuard {
         require(_paymentToken != address(0), "Raffle: invalid payment token");
         require(_assetToken != address(0), "Raffle: invalid asset token");
         require(_assetAmount > 0, "Raffle: invalid asset amount");
-        require(_winnersCount < _ticketCap, "Raffle: invalid winners count");
 
         seller = _seller;
         assetToken = _assetToken;
@@ -230,9 +232,9 @@ contract Raffle is ReentrancyGuard {
         // Raffle succeeds only if totalFunds exactly equals sellerMin by endTime
         // This is a design decision: all tickets must be sold for success (all-or-nothing)
         // Time-based check: if endTime has passed and totalFunds < sellerMin, it has failed
-        succeeded = (block.timestamp >= endTime) && (totalFunds == sellerMin);
+        _succeededState = _succeeded();
 
-        if (succeeded) {
+        if (_succeededState) {
             finalizationBlock = block.number;
             // Calculate protocol fee (from factory)
             uint256 feeBps = RaffleFactory(factory).feeBps();
@@ -251,17 +253,17 @@ contract Raffle is ReentrancyGuard {
             _pickWinners();
         }
 
-        emit Finalized(succeeded, totalFunds);
+        emit Finalized(_succeededState, totalFunds);
     }
 
     /// @notice Claim refund (for losers when raffle failed)
     function claimRefund() external nonReentrant {
-        require(finalized, "Raffle: not finalized");
-        require(!succeeded, "Raffle: raffle succeeded");
+        require(!_succeeded(), "Raffle: raffle succeeded");
         require(tickets[msg.sender] > 0, "Raffle: no tickets");
 
         uint256 refundAmount = tickets[msg.sender] * ticketPrice;
         tickets[msg.sender] = 0; // Prevent double claim
+        refundClaimedAllTickets[msg.sender] = true;
 
         IERC20(paymentToken).safeTransfer(msg.sender, refundAmount);
 
@@ -272,7 +274,7 @@ contract Raffle is ReentrancyGuard {
     /// @dev Winners are picked automatically during finalize(), so they should already be set
     function claimPrize() external nonReentrant {
         require(finalized, "Raffle: not finalized");
-        require(succeeded, "Raffle: raffle failed");
+        require(_succeeded(), "Raffle: raffle failed");
         require(winnersSet, "Raffle: winners not set");
         require(winners.length > 0, "Raffle: winners not set");
 
@@ -287,6 +289,7 @@ contract Raffle is ReentrancyGuard {
         uint256 prize = pendingWithdrawals[msg.sender];
         require(prize > 0, "Raffle: no prize to claim");
         pendingWithdrawals[msg.sender] = 0;
+        prizeClaimedAll[msg.sender] = true;
 
         // Transfer asset to winner
         IERC20(assetToken).safeTransfer(msg.sender, prize);
@@ -298,7 +301,7 @@ contract Raffle is ReentrancyGuard {
     function withdrawSeller() external nonReentrant {
         require(msg.sender == seller, "Raffle: not seller");
         require(finalized, "Raffle: not finalized");
-        require(succeeded, "Raffle: raffle failed");
+        require(_succeeded(), "Raffle: raffle failed");
 
         uint256 amount = pendingWithdrawals[seller];
         require(amount > 0, "Raffle: nothing to withdraw");
@@ -313,11 +316,12 @@ contract Raffle is ReentrancyGuard {
     /// @notice Withdraw asset by seller if raffle failed
     function withdrawAsset() external nonReentrant {
         require(msg.sender == seller, "Raffle: not seller");
-        require(finalized, "Raffle: not finalized");
-        require(!succeeded, "Raffle: raffle succeeded");
+        require(!_succeeded(), "Raffle: raffle succeeded");
+        require(!assetWithdrawnBySeller, "Raffle: asset already withdrawn");
 
         // Transfer the full asset amount back to seller
         IERC20(assetToken).safeTransfer(seller, assetAmount);
+        assetWithdrawnBySeller = true;
 
         emit AssetWithdrawn(seller, assetAmount);
     }
@@ -333,11 +337,30 @@ contract Raffle is ReentrancyGuard {
         return winners;
     }
 
+    /// @notice Frontend helper for per-user status flags
+    function getUserFlags(
+        address user
+    )
+        external
+        view
+        returns (
+            bool refundClaimed,
+            bool prizeClaimed,
+            uint256 remainingTickets,
+            uint256 pendingPrize
+        )
+    {
+        refundClaimed = refundClaimedAllTickets[user];
+        prizeClaimed = prizeClaimedAll[user];
+        remainingTickets = tickets[user];
+        pendingPrize = pendingWithdrawals[user];
+    }
+
     /// @notice Check if raffle has failed based on time and funds
     /// @return True if endTime has passed and totalFunds < sellerMin
     function hasFailed() external view returns (bool) {
         if (finalized) {
-            return !succeeded;
+            return !_succeededState;
         }
         // Time-based check: if endTime has passed and we haven't reached sellerMin, it has failed
         return (block.timestamp >= endTime) && (totalFunds < sellerMin);
@@ -390,6 +413,23 @@ contract Raffle is ReentrancyGuard {
 
         emit WinnersSet(winners);
         winnersSet = true;
+    }
+
+    /// @notice Get succeeded status
+    /// @return True if raffle succeeded (finalized and totalFunds == sellerMin)
+    function succeeded() external view returns (bool) {
+        if (finalized) {
+            return _succeededState;
+        }
+        return _succeeded();
+    }
+
+    function _succeeded() internal view returns (bool) {
+        if ((block.timestamp >= endTime)) {
+            return (block.timestamp >= endTime) && (totalFunds == sellerMin);
+        } else {
+            return false;
+        }
     }
 }
 

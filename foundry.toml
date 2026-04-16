@@ -11,7 +11,7 @@ remappings = [
     "@openzeppelin/=lib/openzeppelin-contracts/",
 ]
 [rpc_endpoints]
-base = "https://api.zan.top/base-mainnet"
+base = "https://rpc.ankr.com/base/9e64a36c7e0f3263c3a4421ca31c765769f9cce569e0b8d776ac204c7b8278e1"
 base-sepolia = "https://sepolia.base.org"
 
 [profile.ci]
