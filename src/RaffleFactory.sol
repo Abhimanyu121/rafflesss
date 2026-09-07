@@ -3,32 +3,31 @@ pragma solidity ^0.8.20;
 
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {
-    SafeERC20
-} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Raffle} from "./Raffle.sol";
 import {IRandomnessProvider} from "./interfaces/IRandomnessProvider.sol";
 
 /// @title RaffleFactory
-/// @notice Factory for deploying Raffle clones (EIP-1167)
-/// @dev Manages global settings and deploys minimal proxy clones
-contract RaffleFactory is Ownable {
+/// @notice Creates raffles as EIP-1167 clones and holds the terms new raffles are born with.
+/// @dev Settings here apply only to raffles created from now on: a raffle copies the fee,
+///      recipient and provider at creation and never reads them again.
+contract RaffleFactory is Ownable2Step {
     using Clones for address;
     using SafeERC20 for IERC20;
 
-    // ============ State Variables ============
+    /// @notice Hard ceiling on the protocol fee. Not adjustable.
+    uint256 public constant MAX_FEE_BPS = 1000; // 10%
+
     address public immutable RAFFLE_IMPLEMENTATION;
     address[] public raffles;
     mapping(address => bool) public isRaffle;
 
-    uint256 public feeBps; // Basis points (e.g., 200 = 2%)
+    uint256 public feeBps;
     address public feeRecipient;
-
-    // Extensibility: adapters for future features
     IRandomnessProvider public randomnessProvider;
 
-    // ============ Events ============
     event RaffleCreated(
         address indexed raffle,
         address indexed seller,
@@ -46,35 +45,29 @@ contract RaffleFactory is Ownable {
     event FeeRecipientUpdated(address oldRecipient, address newRecipient);
     event RandomnessProviderUpdated(address oldProvider, address newProvider);
 
-    // ============ Errors ============
     error InvalidFeeBps();
     error InvalidAddress();
+    error SellerMustBeCaller();
+    error UnsupportedAssetToken();
 
-    // ============ Constructor ============
-    constructor(address _feeRecipient, uint256 _feeBps) Ownable(msg.sender) {
-        require(_feeRecipient != address(0), "Factory: invalid fee recipient");
-        require(_feeBps <= 10000, "Factory: invalid fee bps");
+    /// @param _owner Passed explicitly: a CREATE2 deployment routes through a proxy, so
+    ///        msg.sender here would be that proxy rather than the operator.
+    constructor(address _owner, address _feeRecipient, uint256 _feeBps, address _provider) Ownable(_owner) {
+        // A zero owner is already rejected by Ownable's constructor.
+        if (_feeRecipient == address(0)) revert InvalidAddress();
+        if (_provider == address(0)) revert InvalidAddress();
+        if (_feeBps > MAX_FEE_BPS) revert InvalidFeeBps();
 
         feeRecipient = _feeRecipient;
         feeBps = _feeBps;
+        randomnessProvider = IRandomnessProvider(_provider);
 
-        // Deploy implementation contract
-        Raffle implementation = new Raffle();
-        RAFFLE_IMPLEMENTATION = address(implementation);
+        RAFFLE_IMPLEMENTATION = address(new Raffle(address(this)));
     }
 
-    // ============ Public Functions ============
-    /// @notice Create a new raffle
-    /// @param assetToken The asset token address (0x0 for ETH)
-    /// @param assetAmount The amount of asset
-    /// @param paymentToken The payment token address (0x0 for ETH)
-    /// @param ticketPrice The price per ticket
-    /// @param ticketCap Maximum number of tickets
-    /// @param sellerMin Minimum funds required for success
-    /// @param startTime Start timestamp
-    /// @param endTime End timestamp
-    /// @param winnersCount Number of winners
-    /// @return raffle The address of the deployed raffle clone
+    /// @notice Create a raffle and escrow its prize, taken from the caller.
+    /// @dev `raffleSeller` must be the caller or zero. It cannot name a third party: an
+    ///      allowance to this factory is not permission for a stranger to spend it.
     function createRaffle(
         address raffleSeller,
         address assetToken,
@@ -87,36 +80,43 @@ contract RaffleFactory is Ownable {
         uint256 endTime,
         uint16 winnersCount
     ) external returns (address raffle) {
-        // Deploy clone
+        if (raffleSeller != address(0) && raffleSeller != msg.sender) {
+            revert SellerMustBeCaller();
+        }
+
         raffle = RAFFLE_IMPLEMENTATION.clone();
         isRaffle[raffle] = true;
         raffles.push(raffle);
-        address _raffleSeller = msg.sender;
-        if (raffleSeller != address(0)) {
-            _raffleSeller = raffleSeller;
+
+        Raffle(raffle)
+            .initialize(
+                Raffle.RaffleParams({
+                    seller: msg.sender,
+                    assetToken: assetToken,
+                    assetAmount: assetAmount,
+                    paymentToken: paymentToken,
+                    ticketPrice: ticketPrice,
+                    ticketCap: ticketCap,
+                    sellerMin: sellerMin,
+                    startTime: startTime,
+                    endTime: endTime,
+                    winnersCount: winnersCount,
+                    feeBps: feeBps,
+                    feeRecipient: feeRecipient,
+                    randomnessProvider: address(randomnessProvider)
+                })
+            );
+
+        // Escrow the prize and confirm the raffle received all of it.
+        uint256 balanceBefore = IERC20(assetToken).balanceOf(raffle);
+        IERC20(assetToken).safeTransferFrom(msg.sender, raffle, assetAmount);
+        if (IERC20(assetToken).balanceOf(raffle) - balanceBefore != assetAmount) {
+            revert UnsupportedAssetToken();
         }
-
-        // Initialize clone
-        Raffle(raffle).initialize(
-            _raffleSeller,
-            assetToken,
-            assetAmount,
-            paymentToken,
-            ticketPrice,
-            ticketCap,
-            sellerMin,
-            startTime,
-            endTime,
-            winnersCount
-        );
-
-        // Transfer asset from seller to raffle contract
-        // Seller must approve this factory before calling createRaffle
-        IERC20(assetToken).safeTransferFrom(_raffleSeller, raffle, assetAmount);
 
         emit RaffleCreated(
             raffle,
-            _raffleSeller,
+            msg.sender,
             assetToken,
             assetAmount,
             paymentToken,
@@ -129,48 +129,45 @@ contract RaffleFactory is Ownable {
         );
     }
 
-    // ============ Admin Functions ============
-    /// @notice Set protocol fee (basis points)
-    /// @param _feeBps New fee in basis points (max 10000 = 100%)
+    // ============ Admin ============
+
     function setFeeBps(uint256 _feeBps) external onlyOwner {
-        if (_feeBps > 10000) revert InvalidFeeBps();
-        uint256 oldFeeBps = feeBps;
+        if (_feeBps > MAX_FEE_BPS) revert InvalidFeeBps();
+        emit FeeBpsUpdated(feeBps, _feeBps);
         feeBps = _feeBps;
-        emit FeeBpsUpdated(oldFeeBps, _feeBps);
     }
 
-    /// @notice Set fee recipient address
-    /// @param _feeRecipient New fee recipient
     function setFeeRecipient(address _feeRecipient) external onlyOwner {
         if (_feeRecipient == address(0)) revert InvalidAddress();
-        address oldRecipient = feeRecipient;
+        emit FeeRecipientUpdated(feeRecipient, _feeRecipient);
         feeRecipient = _feeRecipient;
-        emit FeeRecipientUpdated(oldRecipient, _feeRecipient);
     }
 
-    /// @notice Set randomness provider (for VRF integration)
-    /// @param _randomnessProvider New randomness provider address
-    function setRandomnessProvider(
-        address _randomnessProvider
-    ) external onlyOwner {
-        address oldProvider = address(randomnessProvider);
-        randomnessProvider = IRandomnessProvider(_randomnessProvider);
-        emit RandomnessProviderUpdated(oldProvider, _randomnessProvider);
+    function setRandomnessProvider(address _provider) external onlyOwner {
+        if (_provider == address(0)) revert InvalidAddress();
+        emit RandomnessProviderUpdated(address(randomnessProvider), _provider);
+        randomnessProvider = IRandomnessProvider(_provider);
     }
 
-    // ============ View Functions ============
-    /// @notice Get total number of raffles created
+    // ============ Views ============
+
     function getRaffleCount() external view returns (uint256) {
         return raffles.length;
     }
 
-    /// @notice Get raffle address by index
     function getRaffle(uint256 index) external view returns (address) {
         return raffles[index];
     }
 
-    /// @notice Get all raffles (for off-chain indexing)
-    function getAllRaffles() external view returns (address[] memory) {
-        return raffles;
+    /// @notice Page through the registry. Prefer this to reading the whole list.
+    function getRaffles(uint256 offset, uint256 limit) external view returns (address[] memory page) {
+        uint256 total = raffles.length;
+        if (offset >= total) return new address[](0);
+        uint256 remaining = total - offset;
+        uint256 count = limit < remaining ? limit : remaining;
+        page = new address[](count);
+        for (uint256 i = 0; i < count; i++) {
+            page[i] = raffles[offset + i];
+        }
     }
 }
