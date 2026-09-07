@@ -1,209 +1,145 @@
-# How Our Raffle Works (Plain English)
+# How the Raffle Works, in Plain Language
 
-*A simple guide to the product flow and the choices we made—no technical jargon.*
+*No code. If you want the technical version, read
+[`PRODUCT_FLOW_AND_DECISIONS.md`](PRODUCT_FLOW_AND_DECISIONS.md).*
 
----
-
-## What We’re Building
-
-We built a raffle system where:
-
-- **Sellers** put up a prize and set the rules. They get paid only if the raffle fully sells out.
-- **Buyers** buy tickets during a set time. They either win a share of the prize or get their money back if the raffle doesn’t sell out.
-- **The system** runs the rules automatically. No one in the middle decides who wins or holds the money.
-
-Everything is designed so that the outcome is clear and fair, and no single party can change the rules or the result once the raffle is set up.
+> **This document was rewritten after a security review.** The earlier version told readers the
+> system was fair and that nobody could take the prize. Neither was true of the code as written.
+> Four serious flaws were found and fixed. This version says what the system actually does.
 
 ---
 
-## How a Raffle Runs (Step by Step)
+## The idea
 
-### 1. Someone Creates a Raffle (The Seller)
+Someone has something they want to raffle off. They lock it in a contract. People buy tickets.
+If every ticket sells, winners are drawn and the prize is split between them. If not, everybody
+gets their money back and the prize goes home.
 
-The seller sets up the raffle by deciding:
-
-- **What’s the prize?** (e.g. a certain amount of a token)
-- **How much is one ticket?** and **How many tickets in total?**
-- **When does it start and end?**
-- **How many winners?** (e.g. 3 winners; the prize is split evenly among them)
-
-The seller then locks the prize in the system. Until the raffle is over, that prize stays locked. No one can take it out except according to the rules (either to winners or back to the seller).
-
-We also allow “creating a raffle for someone else”: another person or app can set it up, but the prize always comes from the actual seller’s account, so the seller stays in control.
+Nobody runs it. There is no operator who picks winners, holds the money, or decides anything.
 
 ---
 
-### 2. People Buy Tickets (Buyers)
+## The three people involved
 
-During the raffle period, anyone can buy tickets. For each purchase they choose:
+**The seller** puts up the prize and gets the money if every ticket sells.
 
-- How many tickets to buy
-- Who gets the tickets (themselves or someone else, e.g. a gift)
+**The buyers** pay for tickets. They either win a share of the prize or get refunded.
 
-Payment is always taken from the person paying. The tickets can be assigned to a different person (e.g. you pay, your friend gets the tickets).
-
-The system makes sure:
-
-- The raffle is still open
-- The total number of tickets isn’t exceeded
-- No single account can buy more than a set maximum (so one person doesn’t dominate)
-
-Once you buy, your money is in the raffle until it ends. Then you either win a share of the prize or get a refund.
+**The protocol** takes a small percentage of successful raffles, capped at ten percent, and has
+no say in anything else.
 
 ---
 
-### 3. The Raffle Ends and the Result Is Decided (Finalization)
+## What happens, step by step
 
-When the end time is past, the raffle can be “finalized.” **Anyone** can trigger this—the seller doesn’t have to. The system then looks at one thing:
+**1. The seller creates the raffle.** They choose the prize, the ticket price, how many tickets,
+how long it runs, and how many winners. The prize moves into the contract straight away.
 
-**Did every ticket get sold?**
+From that moment the prize is locked. The seller cannot take it back while tickets are on sale.
+The one exception is that they can call the whole thing off while nobody has bought anything yet,
+which is there for the case where they got the details wrong.
 
-- **If yes (full sell-out):**  
-  The raffle “succeeds.” The system takes a small fee (e.g. 2%), gives the rest of the ticket money to the seller, picks the winners in a fair way, and records how much each winner gets. No one chooses the winners by hand—it’s done by the rules.
+**2. People buy tickets.** You pay, you get tickets. You can buy them for someone else as a gift.
+Once you have paid, your money stays in the contract until the raffle ends. There is no way to
+change your mind.
 
-- **If no (even one ticket left unsold):**  
-  The raffle “fails.” No fee is taken, no winners are picked. All buyers can get their money back, and the seller can take the prize back.
+**3. The raffle ends.** After the deadline, anybody can trigger the next step. Not just the
+seller. This matters, because it means the seller cannot stall a raffle they dislike the look of.
 
-So the only question at the end is: sold out or not? Everything else (who wins, who gets paid) follows from that.
+Only one question gets answered here: did every ticket sell?
 
----
+- **No.** The raffle failed. Everyone gets their money back and the seller takes the prize home.
+- **Yes.** The contract asks for a random number and waits.
 
-### 4. People Collect What They’re Owed (Settlement)
+**4. The winners are drawn.** When the random number arrives, anybody can trigger the draw. The
+winners are picked and the prize is divided between them.
 
-After the raffle is finalized, people don’t get paid automatically. They **claim** what they’re owed:
-
-- **Winners** claim their share of the prize.
-- **Buyers (if the raffle failed)** claim a full refund of what they paid for tickets.
-- **Seller (if the raffle succeeded)** claims the ticket money (after the fee).
-- **Seller (if the raffle failed)** claims the prize back.
-
-So: the system doesn’t “send” money to anyone. It keeps a record of who is owed what, and when they’re ready they ask for it. That way we avoid problems like payments failing or getting stuck, and everyone gets their funds when they choose to collect.
-
----
-
-## Why We Made These Choices
-
-Below are the main decisions we made and the reasoning in simple terms.
+**5. Everyone collects.** Winners collect their prize. In a failed raffle, buyers collect their
+refunds and the seller collects the prize back. Nothing is ever sent automatically. You ask for
+your money when you want it.
 
 ---
 
-### 1. All-or-Nothing: Either Full Sell-Out or Full Refund
+## Where does the random number come from?
 
-**What we do:** The raffle only “succeeds” if every single ticket is sold. If one ticket is left unsold, the raffle fails and everyone gets refunds (and the seller gets the prize back).
+From Chainlink, an outside service that produces random numbers and proves mathematically that it
+did not fiddle with them. The contract checks that proof and refuses anything that fails it.
 
-**Why:** We wanted a single, clear rule: “Did we hit the target or not?” No grey area like “we sold 80%, so we’ll run it anyway.” That makes it easy to explain and to trust. It also encourages sellers to set a realistic price and number of tickets.
+**The old version did this badly, and it is worth explaining why.**
 
-**Trade-off:** Some might prefer “run if we hit 80%.” We chose simplicity and a clear yes/no outcome.
+It used to pick winners from the fingerprints of recent blocks on the blockchain. Those
+fingerprints look random, and they cannot be altered once written. So it seemed safe.
 
----
+The problem was not that anyone could change them. It was that anyone could *read them first*.
+Because anybody was allowed to trigger the draw at any moment, and the fingerprints it would use
+were already public, a ticket holder could work out who would win before doing anything. If it
+was not them, they waited two seconds and checked again. Free retries, forever, until they won.
 
-### 2. One Clear Rule for “Target”
+Imagine a lottery where the winning number is the temperature outside at the moment you press the
+button. Nobody can change the weather. But you can look at the thermometer, and only press when
+it suits you. The number is honest. The choosing is not.
 
-**What we do:** The “target” to succeed is always: ticket price × total number of tickets. Sellers can’t set a different target that doesn’t match.
+In testing, somebody holding a third of the tickets waited about a minute and then won every
+prize. Somebody who played honestly and triggered the draw straight away won nothing.
 
-**Why:** So there’s no confusion. “Success” always means “every ticket sold.” You can’t accidentally set things so the raffle can never succeed or so “success” means something else.
-
-**Trade-off:** Slightly less flexibility (e.g. no “soft launch” with a lower target). We preferred clarity.
-
----
-
-### 3. Only Token Payments (No “Raw” Native Currency in the Core)
-
-**What we do:** All money in and out is in the form of tokens (like stablecoins or wrapped currency). We don’t handle the native chain currency directly in the core product.
-
-**Why:** Supporting both “raw” currency and tokens adds a lot of edge cases and complexity. Most users can use a token version of the currency (e.g. wrapped) or a stablecoin. Keeping everything as tokens keeps the system simpler and safer to run.
-
-**Trade-off:** Users who want to pay in the chain’s native currency need one extra step (e.g. wrap it first). We accepted that for a simpler, more reliable system.
+Now the random number does not exist yet at the moment the raffle is settled, so there is nothing
+to look at and nothing to wait for.
 
 ---
 
-### 4. You Claim Your Winnings or Refund (We Don’t Send Automatically)
+## What happens if something goes wrong?
 
-**What we do:** After the raffle ends, winners and refund recipients don’t get paid automatically. They have to take an action to “claim” their share.
+The main risk with relying on an outside service is that it goes quiet and your money is stuck.
+So there are three ways out, and all of them refund everybody:
 
-**Why:** Automatically sending to a long list of people can fail (e.g. some addresses can’t receive). That could block everyone or create security issues. When people claim themselves, each transfer is separate and under their control. We also avoid certain attack patterns that can happen when the system “pushes” money out.
+- The seller calls it off before anyone has bought a ticket.
+- The random number does not arrive within a day.
+- Nobody bothers to settle the raffle at all, and a month goes by.
 
-**Trade-off:** People have to remember to claim. We think that’s acceptable and we can build reminders or simple tools for that.
-
----
-
-### 5. How We Pick Winners (Fair and Automatic)
-
-**What we do:** Winners are chosen at the moment the raffle is finalized, using a process that depends on data that’s already public and fixed (from past activity on the chain). We don’t use “future” data that could be influenced.
-
-**Why:** We want the result to be fair and not manipulable. Using only past, fixed data means no one can change the outcome after the fact. We also cap how many winners we pick so we always have enough data to do this safely.
-
-**Trade-off:** For very high-stakes raffles, one could use a more advanced randomness service later. We built the system so that can be added without changing the basic flow.
+Anyone can trigger the last two. Nothing depends on a particular person doing their job.
 
 ---
 
-### 6. Winners Are Decided When the Raffle Ends (Not When Someone Claims)
+## What the contract will not let anyone do
 
-**What we do:** As soon as we know the raffle sold out, we immediately decide who the winners are and how much each gets. We don’t wait until the first person claims.
-
-**Why:** So there’s one clear moment when the outcome is fixed. Everyone can see who won and how much. No dependency on who claims first or in what order.
-
-**Trade-off:** The raffle has to end when we have enough “past data” to pick winners. We set limits (e.g. max number of winners) so this is always possible in normal use.
-
----
-
-### 7. The Same Person Can Win More Than Once
-
-**What we do:** If someone bought many tickets, they can appear as a winner more than once and get multiple prize shares.
-
-**Why:** We treat each ticket as one chance. More tickets mean more chances, including the chance to win several times. Forbidding that would complicate the rules and could make the odds less intuitive.
-
-**Trade-off:** A single big buyer could win several prizes. We limit how many tickets one account can hold so no one can completely dominate, and we’re transparent about this behavior.
+- **The seller cannot take the prize back** once someone has bought a ticket, until the raffle has
+  properly ended.
+- **Buyers cannot pull their money out** partway through and still keep their tickets in the draw.
+  The old version let them, which meant somebody could get a full refund and still win.
+- **Nobody can create a raffle using your tokens.** The old version let a stranger name you as the
+  seller and raffle your tokens off on terms they invented. If you have ever approved the old
+  contract, cancel that approval.
+- **The operator cannot change the rules of a raffle that is already running.** The fee is fixed
+  when the raffle is created. The old version read it at the end, so the operator could set it to
+  a hundred percent after all the tickets had sold and take everything.
+- **The same ticket cannot win twice.** If you hold several tickets you can still win several
+  prizes, which is the point of buying several. But one ticket cannot be paid out twice while
+  another ticket that never won gets nothing, which is what used to happen.
 
 ---
 
-### 8. One Shared “Template,” Many Raffles
+## Things we are honest about
 
-**What we do:** Instead of building a whole new system for every raffle, we use one shared design and create a lightweight “instance” for each new raffle. A central “factory” keeps the list and the global settings (like the fee).
+**Buying lots of tickets improves your odds.** That is how a raffle works. There is no limit on
+how many one person can buy. There used to be a limit, but it was easy to sidestep with a second
+wallet, and a rule that does not work is worse than no rule because people trust it.
 
-**Why:** Creating a full copy for every raffle would be expensive and slow. Lightweight instances are cheap and fast to create, so we can run many raffles without wasting resources. The factory also gives one place for things like the fee and who receives it.
+**Once the random number arrives, anyone can work out the winners** before the draw is formally
+recorded. This does not matter. The number is already fixed by then, so knowing the answer early
+changes nothing.
 
-**Trade-off:** We didn’t add “upgrading” the shared design in the first version; we wanted to keep the model simple and predictable.
+**Some kinds of token do not work here.** Tokens that take a cut of every transfer are rejected
+outright. Tokens that change your balance on their own are not safe to use and should be avoided.
 
----
-
-### 9. Anyone Can “Close” the Raffle After the End Time
-
-**What we do:** After the end time, any person or app can trigger the step that closes the raffle and decides success or failure. The seller doesn’t have to do it.
-
-**Why:** So the seller can’t delay or refuse to close the raffle. If they don’t do it, someone else can. The result depends only on the rules and the data (e.g. how many tickets were sold), not on who triggers the closing step.
-
-**Trade-off:** None from a fairness perspective—it only makes the system more neutral and reliable.
-
----
-
-### 10. Limits on Tickets per Person and on Number of Winners
-
-**What we do:** We cap how many tickets one account can buy (e.g. 10,000) and how many winners a single raffle can have (e.g. 200).
-
-**Why:** The per-account cap keeps a single buyer from taking over the whole raffle. The winner cap keeps the “draw” process simple and safe and ensures we always have enough data to pick winners in a fair way.
-
-**Trade-off:** Very large raffles (e.g. thousands of winners) would need a different design; we optimized for the common case and left room to extend later.
+**This code has not been independently audited.** It has been reviewed, the problems found are
+written down publicly, and there are tests that reproduce every one of them. That is not the same
+as an audit.
 
 ---
 
-## Quick Summary
+## The short version
 
-| What | Our choice | Main reason |
-|------|------------|-------------|
-| When does the raffle “succeed”? | Only when every ticket is sold | Simple, clear rule |
-| How is the target defined? | Ticket price × number of tickets, no other option | No confusion or misconfiguration |
-| What can people pay with? | Tokens only (e.g. stablecoins, wrapped currency) | Simpler and safer system |
-| How do people get paid? | They claim; we don’t send automatically | Fewer failures, more control, better security |
-| How are winners chosen? | Automatically at end time using past, fixed data | Fair and not manipulable |
-| When are winners decided? | Right when we know it sold out | One clear moment, no dependency on who claims first |
-| Can one person win multiple times? | Yes | Matches “more tickets = more chances” |
-| How are new raffles created? | From a shared template, via a factory | Cheap and fast, one place for settings |
-| Who can close the raffle? | Anyone after the end time | Seller can’t block or delay |
-| Any limits? | Max tickets per person, max winners per raffle | Fairness and reliable winner selection |
-
----
-
-## In One Paragraph
-
-Sellers create a raffle and lock the prize. Buyers buy tickets during the open period. When the end time has passed, anyone can close the raffle. If every ticket was sold, the raffle succeeds: the system takes a small fee, pays the seller, picks winners automatically, and records what each winner gets. If not, the raffle fails: no fee, no winners, and everyone can get their money back and the seller can take the prize back. After that, winners and refund recipients claim their share when they want—we don’t send automatically. Every choice we made was to keep the rules simple, the outcome clear, and the system fair and secure.
+Create, buy, settle, draw, collect. Nobody runs it. The prize is locked until the raffle properly
+ends. Every ticket has to sell or everyone gets refunded. Winners are drawn using a random number
+nobody can predict or choose. And if anything gets stuck, there is always a way for anyone to end
+it and give everybody their money back.

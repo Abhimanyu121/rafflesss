@@ -1,227 +1,190 @@
 # Raffle System Mechanisms
 
-## Overview
+How the contracts actually work. Vocabulary is defined in [`CONTEXT.md`](CONTEXT.md).
 
-A gas-efficient raffle system using EIP-1167 minimal proxy clones. Each raffle sells tickets for ERC20 tokens and distributes prizes to randomly selected winners.
+Where this document once described behaviour the code did not implement, that gap was the direct
+cause of several critical vulnerabilities. It is now written from the code. If the two disagree,
+that is a bug in one of them and worth chasing down.
 
-## Core Mechanisms
+## 1. Factory and clones
 
-### 1. Factory Pattern (EIP-1167 Clones)
+The factory deploys one `Raffle` implementation in its constructor, passing its own address so
+the implementation records permanently which factory may initialize clones of it. The
+implementation is then locked with `_disableInitializers()`, so it can never be used as a raffle
+itself.
 
-**Purpose**: Gas-efficient deployment of multiple raffles
-
-- **RaffleFactory** deploys a single implementation contract
-- Each new raffle is a minimal proxy clone (45 bytes) pointing to the implementation
-- Saves ~95% gas compared to deploying full contracts
-- Factory manages global settings (protocol fees, randomness provider)
-
-**Flow**:
+Each new raffle is an EIP-1167 minimal proxy, about 45 bytes of code delegating to the
+implementation. Creation, initialization and prize escrow all happen in one transaction:
 
 ```
-Factory.createRaffle()
-  → Clone deployed (EIP-1167)
-  → Clone.initialize() called
-  → Assets transferred from seller to clone
+createRaffle()
+  → clone deployed
+  → clone.initialize(params)   ← reverts unless msg.sender is the factory
+  → prize transferred from the caller into the clone
+  → balance checked: the clone must have received exactly assetAmount
 ```
 
-### 2. Ticket Purchase Mechanism
+The prize is always pulled from `msg.sender`. A `raffleSeller` argument is accepted for backward
+compatibility but must equal the caller or be zero. It cannot name a third party, because an
+ERC20 allowance is permission to move tokens for your own raffle, not permission for a stranger
+to spend it on terms they chose.
 
-**Function**: `buyTickets(uint256 n, address recipient)`
+## 2. States
 
-**Process**:
+A raffle is in exactly one of `Uninitialized`, `Active`, `RandomnessPending`, `Succeeded` or
+`Failed`. Every state-changing function begins by requiring a specific state. None of them
+decides from `block.timestamp` what the state should be.
 
-1. Validates raffle is active (`startTime <= now <= endTime`)
-2. Checks ticket cap not exceeded (`totalTickets + n <= ticketCap`)
-3. Enforces per-address limit (`tickets[buyer] + n <= MAX_TICKETS_PER_ADDRESS`)
-4. Validates funds don't exceed sellerMin (`totalFunds + cost <= sellerMin`)
-5. Transfers payment tokens from buyer to raffle contract
-6. Updates state: `totalTickets`, `totalFunds`, `tickets[buyer]`, `ticketHolders[]`
+Clone storage starts as all zeroes, which is why `Uninitialized` is first in the enum.
 
-**Key Constraints**:
+## 3. Buying tickets
 
-- Maximum 10,000 tickets per address (prevents domination)
-- Payment always from `msg.sender` (even if `recipient` is different)
-- Tickets assigned to `recipient` (or `msg.sender` if `address(0)`)
+`buyTickets(n, recipient)` requires the `Active` state and `startTime <= now < endTime`. The
+window is half-open: selling stops at the instant finalization becomes possible, so the two can
+never overlap.
 
-### 3. Finalization & Success Determination
+Tickets are appended to `ticketHolders`, once per ticket, so the array index is the ticket number
+and the value is the holder. Payment always comes from `msg.sender`; the tickets belong to
+`recipient`, or to the caller when that is zero.
 
-**Function**: `finalize()` (anyone can call after `endTime`)
+Accounting is updated before the transfer, and the transfer is then checked against the balance
+delta. A token that delivers less than it was sent is rejected outright rather than quietly
+leaving the raffle unable to pay everyone.
 
-**Success Criteria**:
+There is no per-address ticket limit. The old one counted against the recipient, so a single
+payer could route around it with different recipients, and no on-chain limit can prevent one
+person using several wallets.
 
-- `totalFunds == sellerMin` exactly (all-or-nothing)
-- Must be called after `endTime`
+## 4. Settlement
 
-**Process**:
+`finalize()` requires `Active` and `now >= endTime`. Anyone may call it.
 
-1. Sets `finalized = true`
-2. Calculates `succeeded = (block.timestamp >= endTime) && (totalFunds == sellerMin)`
-3. Stores `_succeededState = succeeded`
-4. If succeeded:
-   - Calculates protocol fee: `(totalFunds * feeBps) / 10000`
-   - Transfers fee to `feeRecipient`
-   - Sets seller payout in `pendingWithdrawals[seller]`
-   - Records `finalizationBlock = block.number`
-   - **Automatically picks winners** via `_pickWinners()`
-5. Emits `Finalized(succeeded, totalFunds)`
+- If `totalFunds != sellerMin`, the raffle did not sell out. State becomes `Failed`. Done.
+- Otherwise state becomes `RandomnessPending` and the raffle asks its provider for a seed.
 
-**Important**: Raffle fails if `totalFunds < sellerMin` at `endTime`
+`finalize()` chooses no winners. This is deliberate: it is what stops the caller from picking the
+outcome by choosing when to send the transaction.
 
-### 4. Winner Selection Mechanism
+## 5. The draw
 
-**Function**: `_pickWinners()` (internal, called during `finalize()` if succeeded)
+`drawWinners()` requires `RandomnessPending` and a seed that has arrived. Anyone may call it. It
+reads the seed, draws the winners, splits the prize, records what the seller and the protocol are
+owed, and moves the state to `Succeeded`.
 
-**Randomness Source**: Blockhashes from past blocks
+**Stretching one seed.** Each round derives its own number as `keccak256(seed, i)`. One honest
+seed therefore produces any number of picks, and everyone can verify the draw afterwards by
+recomputing it.
 
-**Process**:
+**Drawing without replacement.** Think of the tickets as a row of numbered stubs. Round `i` draws
+only from positions `[i, totalTickets)`, and the drawn stub is swapped out of that range, exactly
+like dealing from a deck. No ticket can be drawn twice.
 
-1. Validates sufficient blocks exist: `finalizationBlock >= winnersCount`
-2. For each winner (0 to `winnersCount-1`):
-   - Uses blockhash: `blockhash(finalizationBlock - 1 - i)`
-   - Converts to random: `uint256(blockHash) % totalTickets`
-   - Handles collisions: if ticket already won, tries next ticket (up to 3 attempts)
-   - Allows duplicate wins after 3 collision attempts (by design)
-   - Adds winner to `winners[]` array
-   - Calculates prize: `assetAmount / winnersCount` (+ remainder distributed to first winners)
-   - Adds prize to `pendingWithdrawals[winner]`
-3. Sets `winnersSet = true`
-4. Emits `WinnersSet(winners)`
+To avoid copying the whole row into memory, the row is virtual: position `i` holds ticket `i`
+unless a swap put something else there. Only positions actually touched cost storage, so a
+three-winner draw costs three writes whether the raffle sold ten tickets or ten thousand.
 
-**Constraints**:
+An address holding several tickets occupies several positions and can still win several times.
+That is intended. What cannot happen is one ticket winning twice.
 
-- Maximum 200 winners (ensures blockhashes available within 256-block window)
-- Uses consecutive blocks going backwards from finalization block
-- Users with many tickets can win multiple times (by design)
+**Prize split.** Each winner receives `assetAmount / winnersCount`, and the first
+`assetAmount % winnersCount` winners receive one extra unit, so the credited total is exactly the
+prize. `assetAmount >= winnersCount` is enforced at creation, so no declared winner is credited
+zero.
 
-### 5. Pull-Based Withdrawal Mechanism
+## 6. Escape hatches
 
-**Security Pattern**: Pull-over-push (prevents reentrancy and DoS)
+Three ways a raffle reaches `Failed` other than not selling out. All of them refund everyone and
+take no fee.
 
-**Withdrawal Functions**:
+| Function | Condition | Who |
+|---|---|---|
+| `cancel()` | `Active`, zero tickets sold | seller only |
+| `failOnTimeout()` | `RandomnessPending`, one day elapsed | anyone |
+| `failIfAbandoned()` | `Active`, 7 days past `endTime` | anyone |
 
-#### `claimPrize()` - Winners claim prizes
+These exist so that no outside failure can trap money. A silent oracle, a paused token or simple
+neglect ends in refunds rather than a permanent hole.
 
-- Requires: `finalized`, `succeeded`, `winnersSet`, caller is in `winners[]`
-- Transfers asset tokens from `pendingWithdrawals[winner]` to winner
-- Sets `pendingWithdrawals[winner] = 0` (prevents double claim)
+## 7. Payouts
 
-#### `claimRefund()` - Losers claim refunds
+Every payout is pulled, including the protocol fee. No settlement transaction sends tokens to
+anybody, so a recipient that cannot receive tokens can never block anyone else.
 
-- Requires: `finalized`, `!succeeded`, caller has tickets
-- Calculates: `tickets[caller] * ticketPrice`
-- Transfers payment tokens back to caller
-- Sets `tickets[caller] = 0` (prevents double claim)
+Three ledgers, each in exactly one token, never combined:
 
-#### `withdrawSeller()` - Seller withdraws proceeds
+| Ledger | Token | Claimed by |
+|---|---|---|
+| `sellerProceeds` | payment | `withdrawSeller()`, seller, `Succeeded` |
+| `protocolFeeOwed` | payment | `withdrawFee()`, anyone, sends to the frozen recipient |
+| `pendingPrize[addr]` | prize | `claimPrize()`, the winner, `Succeeded` |
 
-- Requires: `finalized`, `succeeded`, caller is seller
-- Transfers payment tokens from `pendingWithdrawals[seller]` to seller
-- Sets `pendingWithdrawals[seller] = 0`
+Refunds are computed from the ticket count rather than a ledger: `claimRefund()` requires
+`Failed`, zeroes the caller's tickets and returns `tickets * ticketPrice`.
 
-#### `withdrawAsset()` - Seller withdraws assets (if failed)
+`withdrawAsset()` returns the whole prize to the seller in `Failed`. Its flag is set before the
+transfer.
 
-- Requires: `finalized`, `!succeeded`, caller is seller
-- Transfers full `assetAmount` back to seller
+An earlier version kept the seller's proceeds and the winners' prizes in one mapping, in two
+different tokens. A seller who won could claim the sum in the prize token, leaving an honest
+winner unpaid.
 
-**Why Pull-Based?**
+## 8. Protocol fee
 
-- Prevents reentrancy attacks
-- Avoids DoS from unclaimable addresses
-- Users control when they receive funds
+The fee is read from the factory once, at creation, and frozen on the raffle. Later changes to
+the factory apply only to raffles created afterwards. The cap is `MAX_FEE_BPS`, 10%, a constant
+on both contracts that no one can raise.
 
-### 6. State Management
+At settlement the fee is recorded as owed, not sent. `withdrawFee()` pays it out later, to the
+recipient frozen at creation.
 
-**Pre-Finalization State**:
+## 9. Access control
 
-- `finalized = false`
-- `_succeededState` not set
-- `hasFailed()` calculates dynamically: `(block.timestamp >= endTime) && (totalFunds < sellerMin)`
-- `succeeded()` calculates dynamically: `(block.timestamp >= endTime) && (totalFunds == sellerMin)`
+| Function | Who |
+|---|---|
+| `initialize` | the factory only, once |
+| `buyTickets`, `finalize`, `drawWinners`, `failOnTimeout`, `failIfAbandoned`, `withdrawFee` | anyone |
+| `cancel`, `withdrawSeller`, `withdrawAsset`, `recoverToken` | the seller |
+| `claimPrize` | any address with a prize owed |
+| `claimRefund` | any address holding tickets in a failed raffle |
+| `setFeeBps`, `setFeeRecipient`, `setRandomnessProvider` | the factory owner, two-step |
 
-**Post-Finalization State**:
+`claimPrize` proves entitlement from the ledger rather than scanning the winners array.
 
-- `finalized = true`
-- `_succeededState` stored (true if succeeded, false if failed)
-- `hasFailed()` returns `!_succeededState`
-- `succeeded()` returns `_succeededState`
-- Winners set if succeeded
+## 10. Security properties
 
-### 7. Access Control
+1. **State, not time.** Every guard is on the state. This is what closed the refund and prize
+   withdrawal holes, which were both open during the sale because the old check asked whether the
+   raffle had succeeded, and before the deadline that was always false.
+2. **Reentrancy.** Every state-changing function is `nonReentrant`, and state is written before
+   external calls throughout. Note that the guard works in clones because OpenZeppelin treats an
+   uninitialized slot as not-entered; the guard's own constructor never runs for a clone.
+3. **Measured transfers.** Inbound amounts are checked against the balance delta, so tokens that
+   take a cut are rejected instead of silently making the raffle insolvent.
+4. **Solvency.** Obligations are tracked per token and never combined, so the raffle can always
+   pay what it says it owes. Invariant tests in `test/audit/Tokens.t.sol` assert this.
+5. **Bounded loops.** At most 100 winners, a ceiling set so a full draw (about 6M gas,
+   measured) stays well inside a block. `claimPrize` does no scanning.
+6. **Recovery.** `recoverToken` can never touch the prize or the payments, in any state.
 
-**Modifiers**:
+## 11. Extension points
 
-- `onlyFactory`: Only factory can call (for initialization)
-- `onlyActive`: Raffle must be active (`startTime <= now <= endTime`) and not finalized
-- `onlyAfterEnd`: Must be called after `endTime`
-- `nonReentrant`: Prevents reentrancy on all state-changing functions
+`IRandomnessProvider` is the seam. Anything implementing `requestRandomness` and `getRandomness`
+can supply seeds, and the raffle records which provider it was created with. `ChainlinkVRFProvider`
+is the production implementation; `test/mocks/MockRandomnessProvider.sol` drives the tests and is
+never deployed.
 
-**Function-Level Checks**:
+## 12. Timing constants
 
-- `withdrawSeller()`: `msg.sender == seller`
-- `withdrawAsset()`: `msg.sender == seller`
-- `claimPrize()`: Caller must be in `winners[]` array
+| Constant | Value | What it governs |
+|---|---|---|
+| `MIN_DURATION` | 10 minutes | Shortest gap between start and deadline |
+| `RANDOMNESS_TIMEOUT` | 1 day | How long a pending raffle waits for its seed before anyone may fail it |
+| `FINALIZE_GRACE` | 7 days | How long past the deadline an unsettled raffle may be failed by anyone. Also the window a provider that reverts on request costs buyers, since `finalize()` then reverts and the raffle never leaves `Active` |
+| `DRAW_DEADLINE` | 30 days | Backstop. Past this, `failOnTimeout()` fires even if a seed did arrive, so a draw that cannot execute refunds rather than strands |
+| `MAX_WINNERS_COUNT` | 100 | Bounds the draw. A full draw measures about 6M gas |
+| `MAX_FEE_BPS` | 1000 (10%) | Ceiling on the protocol fee, on both contracts, not adjustable |
 
-### 8. Protocol Fee Mechanism
-
-**Configuration**: Set in `RaffleFactory` (basis points, e.g., 200 = 2%)
-
-**Collection**:
-
-- Calculated during `finalize()`: `(totalFunds * feeBps) / 10000`
-- Transferred immediately to `feeRecipient` (if > 0)
-- Seller receives: `totalFunds - protocolFee`
-
-**Admin Functions** (Factory owner only):
-
-- `setFeeBps(uint256 _feeBps)`: Update fee percentage (max 10000 = 100%)
-- `setFeeRecipient(address _feeRecipient)`: Update recipient address
-
-## Design Decisions
-
-### All-or-Nothing Success
-
-- Raffle only succeeds if `totalFunds == sellerMin` exactly
-- Requires all tickets to be sold
-- Enforced by strict equality check: `sellerMin = ticketPrice * ticketCap`
-
-### No Native ETH Support
-
-- Only ERC20 tokens supported
-- Use WETH (Wrapped ETH) for native ETH functionality
-- Prevents complexity of handling ETH transfers
-
-### Multiple Wins Allowed
-
-- Users with many tickets can win multiple times
-- Collision handling allows duplicates after 3 attempts
-- By design - increases fairness for large ticket holders
-
-### Blockhash-Based Randomness
-
-- Uses past blockhashes (not future blocks)
-- Accessible within 256-block window
-- Limited manipulation window (blocks already mined)
-- Can be upgraded to Chainlink VRF via `IRandomnessProvider`
-
-## Security Features
-
-1. **Reentrancy Protection**: `nonReentrant` modifier on all state-changing functions
-2. **Safe Token Transfers**: Uses OpenZeppelin's `SafeERC20`
-3. **Input Validation**: All parameters validated in `initialize()`
-4. **Access Control**: Modifiers and function-level checks
-5. **Pull-Based Withdrawals**: Prevents reentrancy and DoS
-6. **Limits**: Max tickets per address (10,000), max winners (200)
-7. **State Consistency**: Stored state after finalization prevents manipulation
-
-## Gas Optimization
-
-- **EIP-1167 Clones**: ~95% gas savings vs full deployment
-- **Optimizer**: Runs = 200 (balance between size and runtime gas)
-- **Storage Layout**: Packed structs where possible
-- **Events**: Indexed parameters for efficient filtering
-
-## Extensibility Hooks
-
-- **IRandomnessProvider**: Interface for VRF integration
-- **Factory Pattern**: Easy to add new raffle types
-- **Event Emissions**: Comprehensive events for off-chain indexing
+Inside the normal window, `failOnTimeout()` refuses to fire if the seed did arrive, so a late seed
+is drawn rather than refunded and the outcome cannot depend on who called first. Past
+`DRAW_DEADLINE` that check is dropped, because a raffle that can never be drawn must still have a
+way out.
