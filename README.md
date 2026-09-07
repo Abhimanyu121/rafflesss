@@ -1,201 +1,220 @@
 # Raffle Smart Contracts
 
-A minimal, extensible smart contract system for running raffles on Ethereum. Built with Foundry and Solidity 0.8.20.
+On-chain raffles: a seller locks a prize, buyers purchase tickets, and winners are drawn with
+verifiable randomness. Built with Foundry and Solidity 0.8.20.
+
+> **Audit status.** These contracts have not been audited. An earlier version was deployed and
+> found to contain four critical vulnerabilities, all of which are recorded with runnable
+> proofs in [`docs/security/`](docs/security/). This version fixes them. Do not deploy without
+> an independent audit. See [Known limitations](#known-limitations) for what is deliberately
+> not fixed.
 
 ## Overview
 
-This system implements a factory pattern that deploys minimal proxy clones (EIP-1167) for each raffle, making it gas-efficient and extensible. Each raffle:
+Each raffle is an EIP-1167 minimal proxy clone, so creating one costs a fraction of a full
+deployment. A raffle:
 
-- Accepts tickets purchased with ERC20 tokens (use WETH for native ETH)
-- Locks seller assets until the raffle completes
-- Uses pull-based withdrawals for security
-- Supports configurable protocol fees
-- Designed for easy integration with Chainlink VRF (via `IRandomnessProvider` interface)
+- sells a fixed number of tickets for an ERC20 payment token
+- escrows the prize until the raffle settles
+- succeeds only if every ticket sells, and otherwise refunds everyone
+- draws winners from a single seed supplied by Chainlink VRF
+- pays out only when the recipient asks, including the protocol fee
 
-## Architecture
+Vocabulary used throughout the code and docs is defined in [`CONTEXT.md`](CONTEXT.md).
 
-### Contracts
+## Lifecycle
 
-1. **RaffleFactory** - Deploys raffle clones and manages global settings
-   - `createRaffle(address raffleSeller, ...)` - Creates a new raffle clone (raffleSeller can be address(0) to use msg.sender)
-   - `setFeeBps()` - Updates protocol fee (basis points)
-   - `setFeeRecipient()` - Updates fee recipient address
-   - `setRandomnessProvider()` - Sets randomness provider for VRF integration
+A raffle is always in exactly one state. Every function names the state it requires, and none of
+them infers the state from the clock.
 
-2. **Raffle** - Individual raffle contract (deployed as clone)
-   - `buyTickets(uint256 n, address recipient)` - Purchase tickets (ERC20 only, use WETH for native ETH)
-   - `finalize()` - Finalize raffle after end time (automatically picks winners if succeeded)
-   - `claimPrize()` - Winners claim their prizes
-   - `claimRefund()` - Losers claim refunds (if raffle failed)
-   - `withdrawSeller()` - Seller withdraws proceeds
+```
+                    ┌──────────────────────────────────────────┐
+                    │                                          │
+  create ──────► Active ──finalize()──► RandomnessPending ──drawWinners()──► Succeeded
+                    │      (sold out)          │
+                    │                          │ failOnTimeout()  after 1 day
+                    │ finalize() not sold out  │
+                    │ cancel()   while empty   ▼
+                    └──────────────────────► Failed
+                      failIfAbandoned() after endTime + 7 days
+```
 
-3. **IRandomnessProvider** - Interface for randomness providers (extensibility hook)
+| State | Tickets | Refunds | Prizes | Seller |
+|---|---|---|---|---|
+| Active | yes | no | no | may cancel only while no tickets are sold |
+| RandomnessPending | no | no | no | nothing |
+| Succeeded | no | no | yes | withdraws proceeds |
+| Failed | no | yes | no | reclaims the prize |
 
-## Features
+**Succeeded and Failed are permanent.** Nothing moves out of a raffle until it reaches one of them.
 
-- ✅ EIP-1167 minimal proxy clones (gas-efficient)
-- ✅ Support for ERC20 payments (use WETH for native ETH)
-- ✅ Pull-based withdrawals (secure)
-- ✅ Reentrancy protection
-- ✅ Configurable protocol fees
-- ✅ Extensible randomness provider interface
-- ✅ Comprehensive test coverage
-- ✅ Fuzz testing
+## Contracts
 
-## Security
+**`RaffleFactory`** creates raffles and holds the terms new ones are born with.
+`createRaffle(...)` pulls the prize from the caller, `setFeeBps`, `setFeeRecipient` and
+`setRandomnessProvider` set defaults for future raffles only. Ownership is two-step, and the
+fee is capped at `MAX_FEE_BPS` (10%), which is a constant and cannot be raised.
 
-- Uses OpenZeppelin contracts (`ReentrancyGuard`, `SafeERC20`, `Ownable`)
-- Pull-over-push pattern for fund transfers
-- Access control on critical functions
-- Maximum tickets per address limit (10,000)
-- Maximum winners count limit (200)
-- Input validation on all functions
-- Winners picked automatically during finalize() using past blockhashes
+**`Raffle`** is one raffle, deployed as a clone. `buyTickets`, `finalize`, `drawWinners`,
+`claimPrize`, `claimRefund`, `withdrawSeller`, `withdrawFee`, `withdrawAsset`, plus the three
+escape hatches `failOnTimeout`, `failIfAbandoned` and `cancel`.
+
+**`ChainlinkVRFProvider`** implements `IRandomnessProvider` against Chainlink VRF v2.5. Only
+raffles registered with its factory may spend the subscription.
+
+## Design decisions
+
+**All or nothing.** A raffle succeeds only when `totalFunds == sellerMin`, and `sellerMin` must
+equal `ticketPrice * ticketCap`, so success means every ticket sold. Anything less refunds
+everyone.
+
+**ERC20 only.** No native ETH anywhere. Wrap to WETH and use that. The prize and the payment
+token may be the same token; the contract tracks the two obligations separately.
+
+**Everything is pulled, nothing is pushed.** No settlement transaction sends tokens to anybody,
+including the protocol fee. A recipient that cannot receive tokens can therefore never block
+anyone else's money.
+
+**Terms are frozen at creation.** The fee, the fee recipient and the randomness provider are
+copied into the raffle when it is created. Later changes to the factory cannot alter a raffle
+that is already selling tickets.
+
+**Settling and drawing are separate transactions.** `finalize()` decides only whether the raffle
+sold out. Winners come later, from a seed that did not exist when `finalize()` was sent, so
+whoever sends it has no influence on who wins.
+
+**Every wait has an escape hatch.** If the seed never arrives, anyone may fail the raffle after a
+day. If nobody settles a raffle at all, anyone may fail it 7 days after the deadline. Both
+paths refund everyone and take no fee.
+
+**One ticket wins at most once.** Winners are drawn without replacement from a single seed. An
+address holding several tickets can still win several times, which is intended: more tickets
+mean more chances.
+
+## Randomness
+
+Winners come from one seed, supplied by Chainlink VRF and delivered with a proof the contract
+verifies. That seed is stretched into as many picks as needed by hashing it with the round
+number, and tickets are drawn without replacement using a partial Fisher-Yates shuffle.
+
+The contract does not use `blockhash` anywhere. An earlier version did, and because past block
+hashes are public before a transaction is sent, and `finalize()` may be called by anyone at any
+time, a ticket holder could simulate the draw each block and only submit when they won. That is
+recorded as R-04 in [`docs/security/FINDINGS.md`](docs/security/FINDINGS.md).
 
 ## Development
 
-### Prerequisites
-
-- [Foundry](https://book.getfoundry.sh/getting-started/installation)
-- Solidity 0.8.20+
-
-### Setup
-
 ```bash
-# Install dependencies
-forge install
-
-# Build
 forge build
-
-# Run tests
 forge test
-
-# Run tests with gas reporting
-forge test --gas-report
-
-# Run fuzz tests
-forge test --fuzz-runs 10000
+forge test --match-path 'test/audit/*'    # the security regression suite
+forge coverage
 ```
 
-### Deployment
+The `test/audit/` suite contains the original exploit proofs, inverted so that they now assert
+each attack is blocked. If one of them fails, a vulnerability has been reintroduced.
 
-1. Set environment variables:
+## Deployment
+
+Deploying requires a funded Chainlink VRF subscription on the target network.
+
 ```bash
-export PRIVATE_KEY=your_private_key
+export PRIVATE_KEY=...
 export FEE_RECIPIENT=0x...
-export FEE_BPS=200  # Optional, defaults to 200 (2%)
+export FACTORY_OWNER=0x...          # a Safe or timelock in production
+export VRF_COORDINATOR=0x...        # see .env.example for verified Base addresses
+export VRF_KEY_HASH=0x...
+export VRF_SUBSCRIPTION_ID=...
+export FEE_BPS=200                  # optional, default 200 (2%)
+
+forge script script/Deploy.s.sol:Deploy --rpc-url $RPC_URL --broadcast
 ```
 
-2. Deploy:
+If the deployer is also `FACTORY_OWNER`, the script binds the provider to the factory itself. If
+the owner is a Safe or a timelock, that binding is a separate transaction. Either way, finish with:
+
 ```bash
-forge script script/Deploy.s.sol:Deploy --rpc-url $RPC_URL --broadcast --verify
+export PROVIDER=0x...   # printed by Deploy
+export FACTORY=0x...    # printed by Deploy
+forge script script/SetupProvider.s.sol:SetupProvider --rpc-url $RPC_URL --broadcast
 ```
 
-## Usage
+It binds the provider if that has not happened, then refuses to exit unless the factory and
+provider point at each other and the VRF subscription lists the provider as a funded consumer.
+**A deployment is not ready until that script passes.** Before it does, raffles can be created and
+sold but cannot settle; nothing locks, they release through the abandonment hatch and refund.
 
-### Creating a Raffle
+The provider's factory binding is write-once. A second factory needs its own provider.
 
-```solidity
-address raffle = factory.createRaffle(
-    raffleSeller,    // Seller address (address(0) to use msg.sender)
-    assetToken,      // ERC20 token address (must be non-zero, use WETH for native ETH)
-    assetAmount,     // Amount of asset to raffle
-    paymentToken,    // Payment token (must be non-zero, use WETH for native ETH)
-    ticketPrice,     // Price per ticket
-    ticketCap,       // Maximum tickets
-    sellerMin,       // Minimum funds for success (must equal ticketPrice * ticketCap)
-    startTime,       // Start timestamp
-    endTime,         // End timestamp
-    winnersCount     // Number of winners (max 200)
-);
-```
+### Running costs
 
-**Important Design Decisions:**
-- **All-or-nothing success**: Raffle only succeeds if `totalFunds == sellerMin` exactly (all tickets must be sold)
-- **Strict equality**: `sellerMin` must equal `ticketPrice * ticketCap` (enforced during initialization)
-- **No ETH support**: Use WETH (Wrapped ETH) for native ETH functionality
+Chainlink VRF is paid, from a subscription funded in LINK or native ETH. One request is made per
+raffle that **sells out**; a raffle that misses its target fails without asking for randomness, so
+it costs nothing. Cost per request is
+`gas price x (coordinator overhead + callback gas used) x (1 + premium)`. On Base that is
+150,400 + 435 overhead paying in LINK, our fulfilment measures 27,201 gas, and the premium is 50%
+for LINK or 60% for native — so roughly 267,000 gas-equivalents per settled raffle, which at Base
+gas prices is cents, not dollars.
 
-### Buying Tickets
+What matters more is the **buffer**. The coordinator will not start a request unless the
+subscription can cover the worst case for that gas lane: the full `VRF_CALLBACK_GAS` limit at the
+lane's price, not the gas actually used. Keep the subscription funded well above one request's
+worth, and remember a callback that fails is still charged.
 
-```solidity
-// For ERC20 payment
-paymentToken.approve(raffle, amount);
-raffle.buyTickets(count, address(0)); // address(0) assigns tickets to msg.sender
+On Base Sepolia, testnet LINK is free from Chainlink's faucet, so nothing above costs real money
+until mainnet.
 
-// To buy tickets for someone else (gifting)
-raffle.buyTickets(count, recipientAddress);
+The factory owner is passed in explicitly rather than taken from `msg.sender`, because a CREATE2
+deployment routes through the deterministic deployer proxy, which would otherwise become the
+owner and leave the factory permanently un-administrable.
 
-// For native ETH, use WETH instead:
-// 1. Wrap ETH: weth.deposit{value: amount}()
-// 2. Approve: weth.approve(raffle, amount)
-// 3. Buy: raffle.buyTickets(count, address(0))
-```
+## Trust assumptions
 
-### Finalizing and Winner Selection
+- **The factory owner** sets the fee, the fee recipient and the randomness provider for *future*
+  raffles. They cannot touch a raffle that already exists, cannot exceed the 10% fee cap, and
+  cannot influence any draw. Use a multisig behind a timelock.
+- **The provider owner** cannot influence a draw or move money, but can stall settlement by
+  pointing the provider at a gas lane no node serves, or a subscription the coordinator
+  rejects. Raffles then
+  refund. Give it to the same owner as the factory.
+- **Chainlink** must answer. If it does not, raffles fail and refund rather than locking. The
+  coordinator interface is declared locally rather than vendored, so `test/audit/VRFConformance.t.sol`
+  pins our wire format — request selector, field order, `extraArgs` encoding, callback signature —
+  against Chainlink's published source, and `test/fork/` proves the real coordinator on Base
+  Sepolia accepts a request built by this contract. If either fails, the integration has drifted.
+  Run the fork suite with `BASE_SEPOLIA_RPC_URL` set; it skips itself without one.
+- **Tokens** must behave normally. Money coming in is measured, so a token that delivers less than
+  it was sent is rejected at the moment of transfer. Money going out is measured too: a payout
+  that would debit the escrow by more than the amount owed is refused, because the surplus would
+  be another claimant's money. See below for what is not covered.
 
-```solidity
-// After endTime, anyone can finalize
-// Winners are automatically picked during finalize() if raffle succeeded
-raffle.finalize();
+## Known limitations
 
-// Winners are selected using blockhashes from past blocks (finalizationBlock - 1, -2, -3, etc.)
-// Note: Users with many tickets can win multiple times (by design)
-address[] memory winners = raffle.getWinners();
-```
+These are accepted and documented rather than fixed:
 
-### Claiming
+- **Rebasing tokens.** A balance check at deposit time cannot see a rebase that happens later. A
+  negative rebase can leave a raffle unable to pay everyone. Do not use rebasing tokens.
+- **Tokens that take their fee out of the receiver.** If a token debits the escrow exactly the
+  amount owed but credits the receiver less, nothing here can tell: the escrow stays solvent and
+  no claimant is paid from another's share, but the receiver nets less than the ledger promised.
+  Closing this needs a list of approved tokens rather than a contract check. Recorded as C2-01.
+- **Ticket storage cost.** Buying tickets writes one storage slot per ticket, so a single very
+  large purchase can exceed the block gas limit. Split large purchases across transactions.
+  Recorded as R-14.
+- **No Sybil resistance.** Nothing stops one person using many wallets. The old per-address limit
+  was removed because it never achieved this and its presence implied otherwise.
+- **The draw is public once the seed lands.** Anyone can compute the winners from the seed before
+  `drawWinners()` is mined. This changes nothing, because the seed is already fixed by then.
 
-```solidity
-// Winners claim prizes
-raffle.claimPrize();
+## Security
 
-// Losers claim refunds (if raffle failed)
-raffle.claimRefund();
+Findings, proofs and remediation are in [`docs/security/`](docs/security/):
 
-// Seller withdraws proceeds
-raffle.withdrawSeller();
-```
-
-## Testing
-
-The test suite includes:
-
-- **Unit tests** - Core functionality (create, buy, finalize, claim)
-- **Integration tests** - Full raffle lifecycle
-- **Fuzz tests** - Property-based testing for invariants
-- **Gas snapshots** - Track gas usage
-
-Run all tests:
-```bash
-forge test -vv
-```
-
-## Trust Assumptions
-
-- **Winner Selection**: Uses blockhashes from past blocks (finalizationBlock - 1, -2, etc.). While not as secure as Chainlink VRF, it's sufficient for many use cases. For high-value raffles, consider integrating Chainlink VRF via `IRandomnessProvider`.
-- **Factory Owner**: Should be a Gnosis Safe multisig with timelock.
-- **Randomness**: Blockhashes are manipulable by miners, but using past blocks reduces manipulation window. For production, integrate Chainlink VRF.
-
-## Extensibility
-
-The system is designed for easy extension:
-
-1. **VRF Integration**: Implement `IRandomnessProvider` and set via `setRandomnessProvider()`
-2. **Ticket NFTs**: Add optional ERC-1155 adapter via `ITicketMinter` interface
-3. **Multi-asset**: Extend `AssetVault` for complex asset types
+- [`FINDINGS.md`](docs/security/FINDINGS.md) — the findings register, all 34 with status
+- [`DECISIONS.md`](docs/security/DECISIONS.md) — what was decided and why
+- [`OPEN-QUESTIONS.md`](docs/security/OPEN-QUESTIONS.md) — what still needs a human answer
+- [`test/audit/`](test/audit/) — runnable proofs
 
 ## License
 
 MIT
-
-## Audit Status
-
-⚠️ **This code has not been audited. Do not use in production without a security audit.**
-
-For production deployment:
-1. Complete security audit
-2. Integrate Chainlink VRF
-3. Deploy factory owner as Gnosis Safe multisig
-4. Add timelock for admin functions
-5. Test extensively on testnets
